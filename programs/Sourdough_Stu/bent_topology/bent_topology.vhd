@@ -111,6 +111,13 @@ architecture bent_topology of program_top is
     signal s_filtered_y  : signed(10 downto 0);
     signal s_filtered_u  : signed(10 downto 0);
     signal s_filtered_v  : signed(10 downto 0);
+    -- Freeze-during-blanking feeds: substitute filter output when avid is low.
+    -- variable_filter_s updates s_y_reg every clock (enable only drives 'valid'),
+    -- so without this the state decays toward 0 during blanking causing chroma
+    -- collapse to green.  Feeding back the filter output makes err=0 → no change.
+    signal s_smear_y_feed : signed(10 downto 0);
+    signal s_smear_u_feed : signed(10 downto 0);
+    signal s_smear_v_feed : signed(10 downto 0);
     signal s_smear_cutoff: unsigned(7 downto 0);
     -- vertical blend intermediate
     signal s_smear_v_shift : integer range 0 to 7;
@@ -281,6 +288,15 @@ begin
         end if;
     end process;
 
+    -- Smear freeze-during-blanking: when avid is low, feed the filter its own output
+    -- so err = a - state = 0 and the IIR state holds.
+    s_smear_y_feed <= signed('0' & unsigned(s_warped_d1_y)) when s_avid_smear_en = '1'
+                 else s_filtered_y;
+    s_smear_u_feed <= signed('0' & unsigned(s_warped_d1_u)) when s_avid_smear_en = '1'
+                 else s_filtered_u;
+    s_smear_v_feed <= signed('0' & unsigned(s_warped_d1_v)) when s_avid_smear_en = '1'
+                 else s_filtered_v;
+
     -- Smear cutoff: Knob 3 upper 3 bits → 8 discrete IIR cutoff levels (32 = hard, 192 = soft)
     with unsigned(registers_in(2)(9 downto 7)) select s_smear_cutoff <=
         to_unsigned( 32, 8) when "000",
@@ -307,7 +323,7 @@ begin
         port map(
             clk       => clk,
             enable    => s_avid_smear_en,
-            a         => signed('0' & unsigned(s_warped_d1_y)),
+            a         => s_smear_y_feed,
             cutoff    => s_smear_cutoff,
             low_pass  => s_filtered_y,
             high_pass => open,
@@ -319,7 +335,7 @@ begin
         port map(
             clk       => clk,
             enable    => s_avid_smear_en,
-            a         => signed('0' & unsigned(s_warped_d1_u)),
+            a         => s_smear_u_feed,
             cutoff    => s_smear_cutoff,
             low_pass  => s_filtered_u,
             high_pass => open,
@@ -331,7 +347,7 @@ begin
         port map(
             clk       => clk,
             enable    => s_avid_smear_en,
-            a         => signed('0' & unsigned(s_warped_d1_v)),
+            a         => s_smear_v_feed,
             cutoff    => s_smear_cutoff,
             low_pass  => s_filtered_v,
             high_pass => open,
