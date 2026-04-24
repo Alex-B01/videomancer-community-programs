@@ -143,7 +143,7 @@ architecture bent_topology of program_top is
     -- -------------------------------------------------------------------------
     -- Stage 4: Color crush
     -- -------------------------------------------------------------------------
-    signal s_crush_shift : integer range 0 to 9;
+    signal s_crush_shift : integer range 0 to 15;
     signal s_crush_mask  : unsigned(9 downto 0);
     signal s_crushed_y   : std_logic_vector(9 downto 0);  -- clock 10
     signal s_crushed_u   : std_logic_vector(9 downto 0);

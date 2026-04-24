@@ -204,11 +204,11 @@ begin
     -- Noise amplitude: chaos[9:7] selects how many LFSR bits contribute (0→1px, 7→1023px)
     -- Both amplitude AND probability scale together — small and rare at low chaos.
     with unsigned(registers_in(4)(9 downto 7)) select s_noise_amplitude <=
-        unsigned("000000000" & s_lfsr_q(0))       when "000",   -- 0–1 px
-        unsigned("000000" & s_lfsr_q(3 downto 0)) when "001",   -- 0–15 px
-        unsigned("0000" & s_lfsr_q(5 downto 0))   when "010",   -- 0–63 px
-        unsigned("00" & s_lfsr_q(7 downto 0))     when "011",   -- 0–255 px
-        unsigned(s_lfsr_q(9 downto 0))             when others;  -- 0–1023 px
+        resize(unsigned(s_lfsr_q(0 downto 0)), 10)  when "000",   -- 0–1 px
+        resize(unsigned(s_lfsr_q(3 downto 0)), 10)  when "001",   -- 0–15 px
+        resize(unsigned(s_lfsr_q(5 downto 0)), 10)  when "010",   -- 0–63 px
+        resize(unsigned(s_lfsr_q(7 downto 0)), 10)  when "011",   -- 0–255 px
+        unsigned(s_lfsr_q(9 downto 0))              when others;  -- 0–1023 px
 
     -- Probability gate: noise fires when lfsr[9:0] < chaos. True null at chaos=0.
     -- MUST cast both sides to unsigned — std_logic_vector comparison is invalid VHDL.
@@ -218,7 +218,7 @@ begin
     -- Chaos Gate toggle: '1'=free-running, '0'=bright-areas-only
     s_noise_masked <= s_noise_amplitude
                       when (s_noise_en = '1' and s_chaos_gate = '1')
-                 else s_noise_amplitude and unsigned(data_in.y(9 downto 2) & "00")
+                 else s_noise_amplitude and (unsigned(data_in.y(9 downto 2)) & to_unsigned(0, 2))
                       when (s_noise_en = '1' and s_chaos_gate = '0')
                  else (others => '0');
 
@@ -266,7 +266,7 @@ begin
     -- Motion seeding: compare current line vs previous line at (approximately) same position.
     -- s_data_in_d2_y is data_in.y delayed 3 clocks (v_y_clean(2)) to match BRAM output timing.
     -- s_motion_thresh: inverted 8-bit from Chaos. Chaos=0 → thresh=255 (silent). Chaos=max → thresh=0.
-    s_luma_diff    <= abs(signed('0' & s_prev_y) - signed('0' & s_data_in_d2_y));
+    s_luma_diff    <= unsigned(abs(signed('0' & s_prev_y) - signed('0' & s_data_in_d2_y)));
     s_motion_thresh <= not unsigned(registers_in(4)(9 downto 2));
     s_motion_en    <= '1' when (s_luma_diff(9 downto 2) > s_motion_thresh) else '0';
 
