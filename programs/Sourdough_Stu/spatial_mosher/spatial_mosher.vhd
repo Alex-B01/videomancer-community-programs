@@ -76,6 +76,12 @@ architecture spatial_mosher of program_top is
     signal s_filtered_v       : signed(10 downto 0);
     signal s_filter_coeff     : unsigned(7 downto 0);
 
+    -- Freeze-during-blanking feed for IIR filters (R7: prevents filter→multiplier→BRAM
+    -- self-feedback loop from collapsing to zero over long V-blank intervals).
+    signal s_filter_y_feed    : signed(10 downto 0);
+    signal s_filter_u_feed    : signed(10 downto 0);
+    signal s_filter_v_feed    : signed(10 downto 0);
+
     -- Decay multiply outputs (signed(10 downto 0) — G_WIDTH=11, result already scaled/clamped)
     signal s_decayed_y        : signed(10 downto 0);
     signal s_decayed_u        : signed(10 downto 0);
@@ -309,10 +315,32 @@ begin
     -- Higher cutoff → larger shift → slower IIR → softer colour transition at tears.
     -- Soft (Toggle5='0'): to_unsigned(192,8) → v_k=12 (very gradual)
     -- Hard (Toggle5='1'): to_unsigned(32,8)  → v_k=2  (fast snap)
-    s_filter_coeff <= to_unsigned(192, 8) when s_filter_mode = '0'
+    -- Soft: cutoff=128 → v_k=8 (err/256 per clock — genuinely soft, ~½-line convergence).
+    -- Hard: cutoff=32  → v_k=2 (err/4 per clock — fast snap at tear edges).
+    -- Earlier spec value 192 (v_k=12) was inert for 10-bit data: integer shift of
+    -- any err < 4096 truncates to 0, so filter state never updated. See
+    -- `_meta/found_issues.md` entry "Soft Filter Mode numerically inert".
+    s_filter_coeff <= to_unsigned(128, 8) when s_filter_mode = '0'
                  else to_unsigned(32, 8);
 
-    -- Three instances — one per channel. Input: zero-extend 10-bit BRAM output to 11-bit signed.
+    -- Feed mux with two roles:
+    --   1. Freeze-during-blanking guard (R7): self-feedback when s_avid_d='0' so
+    --      filter state holds during H/V blank intervals.
+    --   2. Metavalue sanitisation (GHDL-sim only): `to_01(..., '0')` maps any
+    --      undefined 'U'/'X' bits from uninitialised BRAM to '0'. Without this,
+    --      the first BRAM read (before any write has landed) injects 'U' into
+    --      the filter state and contaminates s_y_reg permanently — all subsequent
+    --      arithmetic produces 'X', which shows as 0 in the captured output.
+    --      On real iCE40 hardware BRAM initialises to 0 by default, so this is
+    --      a simulation-only guard. Harmless on hardware (extra mask gate).
+    s_filter_y_feed <= signed('0' & to_01(unsigned(s_prev_y), '0')) when s_avid_d = '1'
+                  else s_filtered_y;
+    s_filter_u_feed <= signed('0' & to_01(unsigned(s_prev_u), '0')) when s_avid_d = '1'
+                  else s_filtered_u;
+    s_filter_v_feed <= signed('0' & to_01(unsigned(s_prev_v), '0')) when s_avid_d = '1'
+                  else s_filtered_v;
+
+    -- Three instances — one per channel. Input: zero-extended 11-bit signed via feed mux.
     -- Output low_pass: signed(10 downto 0), pixel value in bits [9:0].
     -- 0-clock contribution to pipeline (combinational from IIR state register).
     filter_y : entity work.variable_filter_s
@@ -320,7 +348,7 @@ begin
         port map(
             clk      => clk,
             enable   => s_avid_d,
-            a        => signed('0' & unsigned(s_prev_y)),
+            a        => s_filter_y_feed,
             cutoff   => s_filter_coeff,
             low_pass => s_filtered_y,
             high_pass => open,
@@ -332,7 +360,7 @@ begin
         port map(
             clk      => clk,
             enable   => s_avid_d,
-            a        => signed('0' & unsigned(s_prev_u)),
+            a        => s_filter_u_feed,
             cutoff   => s_filter_coeff,
             low_pass => s_filtered_u,
             high_pass => open,
@@ -344,7 +372,7 @@ begin
         port map(
             clk      => clk,
             enable   => s_avid_d,
-            a        => signed('0' & unsigned(s_prev_v)),
+            a        => s_filter_v_feed,
             cutoff   => s_filter_coeff,
             low_pass => s_filtered_v,
             high_pass => open,
@@ -574,10 +602,20 @@ begin
             valid  => open
         );
 
-    -- Pixel data outputs — driven only here
-    data_out.y <= std_logic_vector(s_interp_y);
-    data_out.u <= std_logic_vector(s_interp_u);
-    data_out.v <= std_logic_vector(s_interp_v);
+    -- Pixel data outputs — driven only here.
+    -- R1 (hardware-constraints §Constraint 7): clamp to BT.601 broadcast-safe range
+    -- before the port assignment. Y ∈ [64, 940], U/V ∈ [64, 960] in 10-bit. This
+    -- protects the ADV7391 encoder and any downstream recorder/display from
+    -- super-black / super-white / illegal chroma values.
+    data_out.y <= std_logic_vector(to_unsigned(64,  10)) when s_interp_y < to_unsigned(64,  10) else
+                  std_logic_vector(to_unsigned(940, 10)) when s_interp_y > to_unsigned(940, 10) else
+                  std_logic_vector(s_interp_y);
+    data_out.u <= std_logic_vector(to_unsigned(64,  10)) when s_interp_u < to_unsigned(64,  10) else
+                  std_logic_vector(to_unsigned(960, 10)) when s_interp_u > to_unsigned(960, 10) else
+                  std_logic_vector(s_interp_u);
+    data_out.v <= std_logic_vector(to_unsigned(64,  10)) when s_interp_v < to_unsigned(64,  10) else
+                  std_logic_vector(to_unsigned(960, 10)) when s_interp_v > to_unsigned(960, 10) else
+                  std_logic_vector(s_interp_v);
 
     -- Sync delay: C_PROCESSING_DELAY_CLKS=17 entries. Sync outputs at index 16.
     -- Also provides: 3-clock avid (v_avid(2)), 13-clock avid (v_avid(12)),
