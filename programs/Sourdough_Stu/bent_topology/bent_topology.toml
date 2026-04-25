@@ -9,7 +9,7 @@ author = "Alex Ball"
 license = "GPL-3.0"
 categories = ["Glitch", "Feedback", "Synthesis", "Color"]
 program_type = "processing"
-description = "Multi-stage circuit-bent glitch suite. Luma-displaced grid, directional smear, analog ringing, and colour starvation compound through scanline feedback."
+description = "Circuit-bent glitch suite: luma-displaced grid, directional smear, analog ringing, colour starvation, scanline feedback."
 
 [[parameter]]
 parameter_id = "rotary_potentiometer_1"

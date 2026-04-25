@@ -1,0 +1,193 @@
+[program]
+program_id = "com.sourdoughstu.gravity_bleed"
+program_name = "Gravity Bleed"
+program_version = "1.0.0"
+abi_version = ">=1.0,<2.0"
+hardware_compatibility = ["rev_a", "rev_b"]
+core = "yuv444_30b"
+author = "Alex Ball"
+license = "GPL-3.0"
+categories = ["Feedback", "Glitch", "Color", "Synthesis"]
+program_type = "processing"
+description = "Organic feedback decay — wet-paint drips, thermal turbulence, and crystal stalactites via multi-tap line history."
+
+# All 15 timing modes supported. Address arithmetic and BRAM banks sized for 1080p
+# (2048-pixel circular line buffers); SD modes use a fraction of the address range.
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_1"
+control_mode = "linear"
+name_label = "Threshold"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_2"
+control_mode = "linear"
+name_label = "Viscosity"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_3"
+control_mode = "linear"
+name_label = "Wind"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_4"
+control_mode = "linear"
+name_label = "Turb Amp"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_5"
+control_mode = "linear"
+name_label = "Turb Density"
+min_value = 0
+max_value = 1023
+initial_value = 512
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_6"
+control_mode = "linear"
+name_label = "Chroma Decouple"
+min_value = 0
+max_value = 1023
+initial_value = 512
+
+[[parameter]]
+parameter_id = "toggle_switch_7"
+name_label = "Gate Invert"
+value_labels = ["Bright Drips", "Dark Drips"]
+
+[[parameter]]
+parameter_id = "toggle_switch_8"
+name_label = "Liquid / Ice"
+value_labels = ["Liquid", "Ice"]
+
+[[parameter]]
+parameter_id = "toggle_switch_9"
+name_label = "Spectral Invert"
+value_labels = ["Off", "On"]
+
+[[parameter]]
+parameter_id = "toggle_switch_10"
+name_label = "Gravity"
+value_labels = ["Down", "Up"]
+
+[[parameter]]
+parameter_id = "toggle_switch_11"
+name_label = "Infinite Freeze"
+value_labels = ["Off", "On"]
+
+[[parameter]]
+parameter_id = "linear_potentiometer_12"
+control_mode = "linear"
+name_label = "Master Mix"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+# ---------------------------------------------------------------------------
+# Factory presets — sketches; finalize after hardware playtest.
+# Default load state = Clean (everything at default, Master fully dry).
+# User raises Master Mix to reveal baseline drip behaviour, then explores
+# one knob at a time. Each preset defines a distinct aesthetic family.
+# ---------------------------------------------------------------------------
+
+[[preset]]
+name = "Clean"
+rotary_potentiometer_1 = 0
+rotary_potentiometer_2 = 0
+rotary_potentiometer_3 = 0
+rotary_potentiometer_4 = 0
+rotary_potentiometer_5 = 512
+rotary_potentiometer_6 = 512
+toggle_switch_7 = 0
+toggle_switch_8 = 0
+toggle_switch_9 = 0
+toggle_switch_10 = 0
+toggle_switch_11 = 0
+linear_potentiometer_12 = 0
+
+[[preset]]
+name = "Wet Paint"
+rotary_potentiometer_1 = 200
+rotary_potentiometer_2 = 600
+rotary_potentiometer_3 = 0
+rotary_potentiometer_4 = 0
+rotary_potentiometer_5 = 512
+rotary_potentiometer_6 = 512
+toggle_switch_7 = 0
+toggle_switch_8 = 0
+toggle_switch_9 = 0
+toggle_switch_10 = 0
+toggle_switch_11 = 0
+linear_potentiometer_12 = 1023
+
+[[preset]]
+name = "Thermal Rising"
+rotary_potentiometer_1 = 100
+rotary_potentiometer_2 = 700
+rotary_potentiometer_3 = 400
+rotary_potentiometer_4 = 500
+rotary_potentiometer_5 = 600
+rotary_potentiometer_6 = 512
+toggle_switch_7 = 0
+toggle_switch_8 = 0
+toggle_switch_9 = 0
+toggle_switch_10 = 1
+toggle_switch_11 = 0
+linear_potentiometer_12 = 1023
+
+[[preset]]
+name = "Stalactites"
+rotary_potentiometer_1 = 700
+rotary_potentiometer_2 = 300
+rotary_potentiometer_3 = 0
+rotary_potentiometer_4 = 0
+rotary_potentiometer_5 = 512
+rotary_potentiometer_6 = 512
+toggle_switch_7 = 0
+toggle_switch_8 = 1
+toggle_switch_9 = 0
+toggle_switch_10 = 0
+toggle_switch_11 = 0
+linear_potentiometer_12 = 1023
+
+[[preset]]
+name = "Rainbow Cascade"
+rotary_potentiometer_1 = 150
+rotary_potentiometer_2 = 800
+rotary_potentiometer_3 = 200
+rotary_potentiometer_4 = 200
+rotary_potentiometer_5 = 512
+rotary_potentiometer_6 = 768
+toggle_switch_7 = 0
+toggle_switch_8 = 0
+toggle_switch_9 = 1
+toggle_switch_10 = 0
+toggle_switch_11 = 0
+linear_potentiometer_12 = 1023
+
+[[preset]]
+name = "Frozen Frame"
+rotary_potentiometer_1 = 200
+rotary_potentiometer_2 = 600
+rotary_potentiometer_3 = 100
+rotary_potentiometer_4 = 200
+rotary_potentiometer_5 = 512
+rotary_potentiometer_6 = 512
+toggle_switch_7 = 0
+toggle_switch_8 = 0
+toggle_switch_9 = 0
+toggle_switch_10 = 0
+toggle_switch_11 = 1
+linear_potentiometer_12 = 1023
