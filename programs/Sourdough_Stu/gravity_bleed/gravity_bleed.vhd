@@ -3,15 +3,18 @@
 -- SPDX-License-Identifier: GPL-3.0-only
 --
 -- Organic feedback decay — wet-paint drips, thermal turbulence, crystal stalactites.
--- Multi-tap Y line-history (4 banks circular) bound to Viscosity.
+-- Y/U/V each use 2-bank line ping-pong (previous-line feedback).
 --
 -- Pipeline depth: C_PROCESSING_DELAY_CLKS = 10
--- BRAM: 24 EBR estimated (Y: 4 banks × 3 EBR = 12 multi-tap, U/V: 2 banks × 3 EBR each = 12)
+-- BRAM: 6 banks × 2048×10b (canonical per-bank inferred RAM, no init values,
+-- each with own clocked read/write process — see hardware-constraints.md
+-- "BRAM inference anti-patterns"). Target ≤30 EBR / 32-EBR HX4K ceiling.
 --
 -- Path A passive enrichments (always-on, no controls): A1 edge gate-bias, A2 per-channel
 -- chroma jitter scaled by turb amp, A3 edge-modulated k_eff for multi-band feel,
 -- A4 vsync-rate triangle breathing on density LSB.
--- Path C: Viscosity drives both decay rate AND multi-tap depth (single-knob "time presence").
+-- Path C reduced from Option D refactor (2026-04-25): Viscosity drives only IIR k
+-- (decay rate) — multi-tap history depth coupling removed to fit EBR budget.
 --
 -- IIR is reformulated in unsigned-domain (BT.601 0..1023):
 --   out = ((cur << k) - cur + prev) >> k
@@ -53,8 +56,7 @@ architecture gravity_bleed of program_top is
     -- ========================================================================
     signal s_timing      : t_video_timing_port;
     signal s_hcount      : unsigned(C_BUF_DEPTH - 1 downto 0) := (others => '0');
-    signal s_line_bank   : std_logic := '0';                          -- toggles each hsync (UV ping-pong)
-    signal s_write_ptr   : unsigned(1 downto 0) := "00";              -- advances each hsync (Y multi-tap)
+    signal s_line_bank   : std_logic := '0';                          -- toggles each hsync (Y/U/V ping-pong)
 
     -- ========================================================================
     -- Toggle aliases (registers_in(6) bit-packed)
@@ -125,12 +127,10 @@ architecture gravity_bleed of program_top is
     signal s_wb_addr        : unsigned(C_BUF_DEPTH - 1 downto 0);
 
     -- ========================================================================
-    -- Multi-tap Y read pointer (S1 — Path C)
+    -- Bank selector (S1 — Y/U/V all share same line-ping-pong)
     -- ========================================================================
     signal s_k_y_base       : unsigned(2 downto 0);                   -- 1..7 (raw 0 promoted to 1)
-    signal s_tap_offset_y   : unsigned(1 downto 0);                   -- 0..3
-    signal s_y_read_ptr     : unsigned(1 downto 0);                   -- effective Y bank to read
-    signal s_uv_read_bank   : std_logic;                              -- effective UV ping-pong bank
+    signal s_bank_sel       : std_logic;                              -- '0'/'1' chooses which bank to READ
 
     -- ========================================================================
     -- Sigma-delta dither (Viscosity LSB → ±1 to k_eff)
@@ -140,22 +140,34 @@ architecture gravity_bleed of program_top is
     signal s_k_y_dithered   : unsigned(3 downto 0);                   -- can reach 8 before clamp
 
     -- ========================================================================
-    -- Inferred BRAM arrays
-    -- Y: 4 banks circular history (Path C)
-    -- U/V: 2 banks ping-pong each (UV initialised to neutral 512)
+    -- Inferred BRAM arrays — canonical iCE40 inference pattern.
+    -- 6 banks (2 Y + 2 U + 2 V) × 2048 × 10b. NO init values (would block
+    -- BRAM inference; bitstream defaults to zero on hardware, GHDL sim is
+    -- protected by `to_01(...,'0')` wrap on s_prev_*).
+    -- Each bank gets its OWN clocked read process (per-bank output register)
+    -- and its OWN clocked write process (gated by wb_en + bank-select).
+    -- See hardware-constraints.md "BRAM inference anti-patterns" / canonical
+    -- video_line_buffer.vhd reference.
     -- ========================================================================
     type t_bram is array (0 to C_BUF_SIZE - 1) of std_logic_vector(9 downto 0);
 
-    signal bram_y_0 : t_bram := (others => (others => '0'));
-    signal bram_y_1 : t_bram := (others => (others => '0'));
-    signal bram_y_2 : t_bram := (others => (others => '0'));
-    signal bram_y_3 : t_bram := (others => (others => '0'));
-    signal bram_u_a : t_bram := (others => "1000000000");             -- neutral 512
-    signal bram_u_b : t_bram := (others => "1000000000");
-    signal bram_v_a : t_bram := (others => "1000000000");
-    signal bram_v_b : t_bram := (others => "1000000000");
+    signal bram_y_0 : t_bram;
+    signal bram_y_1 : t_bram;
+    signal bram_u_a : t_bram;
+    signal bram_u_b : t_bram;
+    signal bram_v_a : t_bram;
+    signal bram_v_b : t_bram;
 
-    -- BRAM read outputs (S3)
+    -- Per-bank read output registers (1 per bank, written by per-bank read process).
+    -- Combinational mux below selects between 0/A and 1/B based on s_bank_sel.
+    signal s_y_0_out : std_logic_vector(9 downto 0);
+    signal s_y_1_out : std_logic_vector(9 downto 0);
+    signal s_u_a_out : std_logic_vector(9 downto 0);
+    signal s_u_b_out : std_logic_vector(9 downto 0);
+    signal s_v_a_out : std_logic_vector(9 downto 0);
+    signal s_v_b_out : std_logic_vector(9 downto 0);
+
+    -- BRAM read outputs (combinational mux of per-bank registers, S3 boundary)
     signal s_prev_y         : std_logic_vector(9 downto 0);
     signal s_prev_u         : std_logic_vector(9 downto 0);
     signal s_prev_v         : std_logic_vector(9 downto 0);
@@ -254,14 +266,13 @@ begin
     end process;
 
     -- ========================================================================
-    -- S0b: line_bank toggle (UV) and write_ptr advance (Y multi-tap) on hsync_start
+    -- S0b: line_bank toggle (per hsync) — drives Y/U/V ping-pong bank selector
     -- ========================================================================
     process(clk)
     begin
         if rising_edge(clk) then
             if s_timing.hsync_start = '1' then
                 s_line_bank <= not s_line_bank;
-                s_write_ptr <= s_write_ptr + 1;
             end if;
         end if;
     end process;
@@ -457,7 +468,7 @@ begin
     end process;
 
     -- ========================================================================
-    -- S1: Multi-tap Y read pointer + UV bank select (Path C)
+    -- S1: Bank selector — Y/U/V all read from "previous line" bank
     -- ========================================================================
     -- Viscosity → k_y: knob HIGH = sticky/strong feedback (small k); knob LOW = clean (large k).
     -- High viscosity physically means content persists, so feedback gain (1/2^k) is large → k small.
@@ -466,39 +477,61 @@ begin
     s_k_y_base <= "001" when registers_in(1)(9 downto 7) = "111"
              else to_unsigned(7, 3) - unsigned(registers_in(1)(9 downto 7));
 
-    -- tap_offset follows the knob directly: high Viscosity = deeper history reach.
-    -- reg(9..7) range 0..7 → tap_offset 0..3 via >>1.
-    s_tap_offset_y <= resize(shift_right(unsigned('0' & registers_in(1)(9 downto 7)), 1), 2);
-
-    -- Y read pointer: down → write_ptr - tap_offset; up (gravity invert) → +tap_offset+1
-    s_y_read_ptr <= s_write_ptr - s_tap_offset_y when s_gravity_inv = '0'
-               else s_write_ptr + s_tap_offset_y + "01";
-
-    -- UV ping-pong bank: line_bank XOR gravity_invert
-    s_uv_read_bank <= s_line_bank xor s_gravity_inv;
+    -- Read bank = line_bank XOR gravity_invert. Write bank = NOT read bank
+    -- (current line writes to the bank we're not reading from).
+    s_bank_sel <= s_line_bank xor s_gravity_inv;
 
     -- ========================================================================
-    -- S2-S3: BRAM reads (1-cycle synchronous)
+    -- S2-S3: BRAM reads — one clocked process per bank (canonical iCE40
+    -- inference pattern, matches videomancer-sdk video_line_buffer.vhd).
+    -- Output mux is combinational, OUTSIDE the clocked processes.
     -- ========================================================================
-    process(clk)
+    p_rd_y_0 : process(clk)
     begin
         if rising_edge(clk) then
-            case s_y_read_ptr is
-                when "00"   => s_prev_y <= bram_y_0(to_integer(s_rd_addr_y));
-                when "01"   => s_prev_y <= bram_y_1(to_integer(s_rd_addr_y));
-                when "10"   => s_prev_y <= bram_y_2(to_integer(s_rd_addr_y));
-                when others => s_prev_y <= bram_y_3(to_integer(s_rd_addr_y));
-            end case;
-
-            if s_uv_read_bank = '0' then
-                s_prev_u <= bram_u_a(to_integer(s_rd_addr_u));
-                s_prev_v <= bram_v_a(to_integer(s_rd_addr_v));
-            else
-                s_prev_u <= bram_u_b(to_integer(s_rd_addr_u));
-                s_prev_v <= bram_v_b(to_integer(s_rd_addr_v));
-            end if;
+            s_y_0_out <= bram_y_0(to_integer(s_rd_addr_y));
         end if;
     end process;
+
+    p_rd_y_1 : process(clk)
+    begin
+        if rising_edge(clk) then
+            s_y_1_out <= bram_y_1(to_integer(s_rd_addr_y));
+        end if;
+    end process;
+
+    p_rd_u_a : process(clk)
+    begin
+        if rising_edge(clk) then
+            s_u_a_out <= bram_u_a(to_integer(s_rd_addr_u));
+        end if;
+    end process;
+
+    p_rd_u_b : process(clk)
+    begin
+        if rising_edge(clk) then
+            s_u_b_out <= bram_u_b(to_integer(s_rd_addr_u));
+        end if;
+    end process;
+
+    p_rd_v_a : process(clk)
+    begin
+        if rising_edge(clk) then
+            s_v_a_out <= bram_v_a(to_integer(s_rd_addr_v));
+        end if;
+    end process;
+
+    p_rd_v_b : process(clk)
+    begin
+        if rising_edge(clk) then
+            s_v_b_out <= bram_v_b(to_integer(s_rd_addr_v));
+        end if;
+    end process;
+
+    -- Combinational read-bank mux (s_bank_sel='0' → read A/0; '1' → read B/1)
+    s_prev_y <= s_y_1_out when s_bank_sel = '1' else s_y_0_out;
+    s_prev_u <= s_u_b_out when s_bank_sel = '1' else s_u_a_out;
+    s_prev_v <= s_v_b_out when s_bank_sel = '1' else s_v_a_out;
 
     -- Sanitised raw BRAM read for the IIR Liquid blend AND the Ice peak-hold.
     -- to_01 protects against 'U' propagation from uninitialised BRAM (GHDL sim).
@@ -684,28 +717,65 @@ begin
     end process;
 
     -- ========================================================================
-    -- BRAM write-back: Y to history bank (write_ptr), UV to opposite ping-pong
+    -- BRAM write-back — one clocked process per bank (canonical pattern).
+    -- Each process gated by `wb_en AND (bank_sel matches "write to opposite
+    -- of read bank")`. Yosys sees this as a per-port write enable on each
+    -- inferred RAM, which maps cleanly to SB_RAM40_4K WREN.
+    --
+    -- Read bank chosen by s_bank_sel; write bank = NOT s_bank_sel.
+    --   s_bank_sel = '0' → read A/0, write to B/1 banks
+    --   s_bank_sel = '1' → read B/1, write to A/0 banks
     -- ========================================================================
-    process(clk)
+    p_wr_y_0 : process(clk)  -- writes when bank_sel = '1' (read=1, write=0)
     begin
         if rising_edge(clk) then
-            if s_wet_wb_en = '1' then
-                -- Y multi-tap: write to bank pointed-to by current write_ptr
-                case s_write_ptr is
-                    when "00"   => bram_y_0(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_y);
-                    when "01"   => bram_y_1(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_y);
-                    when "10"   => bram_y_2(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_y);
-                    when others => bram_y_3(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_y);
-                end case;
+            if s_wet_wb_en = '1' and s_bank_sel = '1' then
+                bram_y_0(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_y);
+            end if;
+        end if;
+    end process;
 
-                -- UV: write to opposite of read bank
-                if s_uv_read_bank = '0' then
-                    bram_u_b(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_u);
-                    bram_v_b(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_v);
-                else
-                    bram_u_a(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_u);
-                    bram_v_a(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_v);
-                end if;
+    p_wr_y_1 : process(clk)  -- writes when bank_sel = '0' (read=0, write=1)
+    begin
+        if rising_edge(clk) then
+            if s_wet_wb_en = '1' and s_bank_sel = '0' then
+                bram_y_1(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_y);
+            end if;
+        end if;
+    end process;
+
+    p_wr_u_a : process(clk)  -- writes when bank_sel = '1' (read=B, write=A)
+    begin
+        if rising_edge(clk) then
+            if s_wet_wb_en = '1' and s_bank_sel = '1' then
+                bram_u_a(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_u);
+            end if;
+        end if;
+    end process;
+
+    p_wr_u_b : process(clk)  -- writes when bank_sel = '0' (read=A, write=B)
+    begin
+        if rising_edge(clk) then
+            if s_wet_wb_en = '1' and s_bank_sel = '0' then
+                bram_u_b(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_u);
+            end if;
+        end if;
+    end process;
+
+    p_wr_v_a : process(clk)
+    begin
+        if rising_edge(clk) then
+            if s_wet_wb_en = '1' and s_bank_sel = '1' then
+                bram_v_a(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_v);
+            end if;
+        end if;
+    end process;
+
+    p_wr_v_b : process(clk)
+    begin
+        if rising_edge(clk) then
+            if s_wet_wb_en = '1' and s_bank_sel = '0' then
+                bram_v_b(to_integer(s_wb_addr)) <= std_logic_vector(s_wet_v);
             end if;
         end if;
     end process;

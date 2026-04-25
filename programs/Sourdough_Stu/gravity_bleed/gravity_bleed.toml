@@ -148,7 +148,7 @@ toggle_switch_11 = 0
 linear_potentiometer_12 = 1023
 
 [[preset]]
-name = "Crystal Stalactites"
+name = "Stalactites"
 rotary_potentiometer_1 = 700
 rotary_potentiometer_2 = 300
 rotary_potentiometer_3 = 0
