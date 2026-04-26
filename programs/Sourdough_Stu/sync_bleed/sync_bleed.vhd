@@ -32,9 +32,50 @@
 -- counts and an input shift-register chain for the fixed NTSC comb tap.
 -- See docs/guides/hardware-constraints.md "BRAM read-port cost".
 --
--- =====  M5 STATUS — STAGE 1 BRAM + TBC OFFSET COMPUTE  =====
--- Prior milestones: M2 skeleton passthru (commit d2ccea1), M3 analysis
--- branch (commit 075eda3).  This commit lands Stage 1:
+-- =====  M7 STATUS — STAGE 3 NTSC COMB + SIN/COS HUE TWIST  =====
+-- Prior milestones: M2 (d2ccea1), M3 (075eda3), M4+M5 (3e7bb0e), M6 (this).
+-- This commit lands Stage 3:
+--   * NTSC horizontal comb: delta_h = s_y_diode - s_y_chain(6)_aligned
+--     (high-frequency Y energy injected into UV with opposite signs to
+--      produce rainbow moiré, NOT magenta/green axis — pitfall #14).
+--   * NTSC vertical comb: delta_v = s_y_diode - s_y_prev_d (Y from prev
+--     active line, same column).  Same opposite-signed UV inject.
+--   * Knob 4 (NTSC Comb) shift table + sigma-delta dither scales the
+--     combined delta before injection.
+--   * Sin/cos hue twist: bit-sliced shift-add rotation on UV-centred
+--     coordinates.  16-bin C_ROT_TABLE from sync_bleed_lut_pkg gives
+--     ~0.6% RMS approximation of true rotation, multiplierless.  Angle
+--     = (s_y_diode + (cv_global << 2) + Knob 3) mod 1024.  Sigma-delta
+--     dither between adjacent bins from angle LSBs.
+--   * UV swap (Toggle 9) post-rotation.
+--
+-- Pipeline depth bumped 5 → 9 (S5 comb compute + S6 UV inject + S7
+-- rotation lookup + S8 shift-add + UV swap + register).
+--
+-- Subsequent commits add Stage 4 IIR cap bleed + edge ringing (M8),
+-- Stage 5 sync-crush + tape noise + master mix interpolator (M9).
+--
+-- =====  M6 NOTES (preceding) — STAGE 2 DIODE WAVEFOLDER LUTS  =====
+-- Lands Stage 2: envelope-CV-driven diode wavefolder LUTs
+-- with sigma-delta dither between adjacent banks, Toggle 10 (Diode Base)
+-- biasing the active bank range (Soft = 0..2, Hard = 1..3).
+--
+-- Eight 256×10 ROMs initialised from sync_bleed_lut_pkg constants (Python-
+-- generated curves: tanh soft, hard ±0.6 clip, one-fold, three-fold).
+-- Y-side reads each bank once at s_y_tbc(9..2); UV-side reads each bank
+-- twice (U + V) per dual-port ROM pattern — Yosys is expected to map this
+-- as 1 EBR per bank (dual-port read on the same storage), but if we get
+-- replication it'd be 2 EBR per UV bank → 12 EBR total.  Verified post-
+-- synth.
+--
+-- Pipeline depth bumped 3 → 5 (S3 LUT read + S4 LUT mux register).  Sync
+-- delay sized to match.  Wet path now: s_wet_y/u/v <= s_y_diode/etc.
+--
+-- Subsequent commits add Stage 3 NTSC comb + sin/cos hue twist (M7),
+-- Stage 4 IIR cap bleed + edge ringing (M8), Stage 5 sync-crush + tape
+-- noise + master mix interpolator (M9).
+--
+-- =====  M5 NOTES (preceding commit 3e7bb0e) — STAGE 1 BRAM + TBC =====
 --   * Free-running s_wr_addr (avid-gated, mod 2048) so prev-line tap at
 --     offset 1920 actually returns the same X column from the prior line.
 --   * Y bank inferred BRAM with 2 read ports (TBC + prev-line, 10 EBR);
@@ -73,6 +114,7 @@ library work;
 use work.video_stream_pkg.all;     -- t_video_stream_yuv444_30b
 use work.core_pkg.all;             -- t_spi_ram
 use work.video_timing_pkg.all;     -- t_video_timing_port
+use work.sync_bleed_lut_pkg.all;   -- t_diode_lut, t_rot_table, C_DIODE_*, C_ROT_TABLE
 
 architecture sync_bleed of program_top is
 
@@ -80,21 +122,28 @@ architecture sync_bleed of program_top is
     -- Pipeline & buffer constants
     -- ========================================================================
     -- Pipeline depth grows incrementally per milestone.  Final target = 18
-    -- at M9 (interpolator output drives data_out).  Currently at M5:
+    -- at M9 (interpolator output drives data_out).  Currently at M7:
     --   1 clk  : S0   input registration, hcount/vcount, lfsr advance,
     --                 edge mag, wr_addr increment, Y chain shift
-    --   1 clk  : S1   BRAM read (TBC jitter compute is combinational
-    --                 from registered inputs at S0)
-    --   1 clk  : S2   BRAM output registration + to_01 sanitise
+    --   1 clk  : S1   TBC jitter compute (registered — broke the
+    --                 critical path from s_in_top_half to BRAM read DFF)
+    --   1 clk  : S2   BRAM read (rd_addr combinational from registered
+    --                 s_tbc_offset)
+    --   1 clk  : S3   BRAM output registration + to_01 sanitise
+    --   1 clk  : S4   Diode LUT bank reads (8 ROMs in parallel)
+    --   1 clk  : S5   Diode LUT bank-select mux + register
+    --   1 clk  : S6   NTSC comb compute (delta_h + delta_v + scale)
+    --   1 clk  : S7   UV inject (opposite-signed) + register
+    --   1 clk  : S8a  Sin/cos rotation: shift-add products
+    --                 (cos*u, sin*u, cos*v, sin*v in parallel)
+    --   1 clk  : S8b  Sin/cos rotation: sum + clamp + UV swap mux
     -- ─────────
-    --   3 total at M5
+    --  10 total at M7
     --
     -- Future targets:
-    --   M6 (diode LUTs):      +2  →  5 clocks
-    --   M7 (comb + twist):    +4  →  9 clocks
-    --   M8 (IIR + ringing):   +2  → 11 clocks
-    --   M9 (sync-crush + interp): +7 → 18 clocks (with 4-clock interp)
-    constant C_PROCESSING_DELAY_CLKS : integer := 3;
+    --   M8 (IIR + ringing):       +2  → 12 clocks
+    --   M9 (sync-crush + interp): +6  → 18 clocks (with 4-clock interp)
+    constant C_PROCESSING_DELAY_CLKS : integer := 10;
 
     -- BRAM line buffer geometry — 2048 deep covers 1080p active line (1920) + headroom.
     constant C_BUF_SIZE      : integer := 2048;
@@ -259,12 +308,15 @@ architecture sync_bleed of program_top is
     signal s_y_d2            : std_logic_vector(9 downto 0) := (others => '0');
     signal s_motion_proxy    : signed(10 downto 0) := (others => '0');
 
-    -- Computed TBC offset (combinational at S0).  Combines four modulation
-    -- sources, scaled by Knob 5 with sigma-delta dither.  Always
-    -- non-negative (clamped) — TBC reads are at wr_addr - C_TBC_BASE -
-    -- s_tbc_offset, and we never want to read into the future.
+    -- Computed TBC offset — REGISTERED at end of S0 to break the
+    -- combinational chain s_in_top_half → cv mux → adds/shifts → rd_addr
+    -- → BRAM read DFF.  At M7 this chain was the critical path, capping
+    -- Fmax at ~46 MHz.  Registering the offset adds 1 cycle to pipeline
+    -- and brings Fmax back over the 74.25 MHz target.  Aesthetically
+    -- invisible: the offset is now 1 active-pixel "stale" relative to
+    -- the wr_addr but TBC reads are bounded by the offset anyway.
     -- Distinct from s_tbc_jitter (the raw Knob 5 register value).
-    signal s_tbc_offset      : unsigned(8 downto 0);
+    signal s_tbc_offset      : unsigned(8 downto 0) := (others => '0');
 
     -- Sigma-delta dither for Knob 5 lower 7 bits (idiom #15).  Smooths
     -- perceived control across adjacent shift-amount levels.
@@ -272,9 +324,117 @@ architecture sync_bleed of program_top is
     signal s_jitter_shift_eff  : integer range 0 to 7 := 0;
 
     -- ========================================================================
-    -- "Wet" output — at M5 this is the Stage 1 BRAM tap (TBC-jittered Y/U/V).
-    -- Subsequent milestones layer Stages 2-5 on top.  Master mix
-    -- interpolator arrives at M9; until then output is direct s_*_tbc.
+    -- Stage 2 (M6): Diode wavefolder LUTs.
+    -- ========================================================================
+
+    -- Eight ROM signals initialised from package constants — 4 Y-side
+    -- banks + 4 UV-side banks.  Each bank holds 256 × 10b values mapping
+    -- input → wavefolded output.  Initialised at declaration so Yosys
+    -- recognises them as ROM (different inference path from the line
+    -- buffers; init values are required for ROM, prohibited for RAM).
+    signal lut_y_b0   : t_diode_lut := C_DIODE_Y_BANK_0;
+    signal lut_y_b1   : t_diode_lut := C_DIODE_Y_BANK_1;
+    signal lut_y_b2   : t_diode_lut := C_DIODE_Y_BANK_2;
+    signal lut_y_b3   : t_diode_lut := C_DIODE_Y_BANK_3;
+    signal lut_uv_b0  : t_diode_lut := C_DIODE_UV_BANK_0;
+    signal lut_uv_b1  : t_diode_lut := C_DIODE_UV_BANK_1;
+    signal lut_uv_b2  : t_diode_lut := C_DIODE_UV_BANK_2;
+    signal lut_uv_b3  : t_diode_lut := C_DIODE_UV_BANK_3;
+
+    -- Per-bank LUT read outputs at S3 (clocked).
+    signal s_y_diode_b0  : unsigned(9 downto 0);
+    signal s_y_diode_b1  : unsigned(9 downto 0);
+    signal s_y_diode_b2  : unsigned(9 downto 0);
+    signal s_y_diode_b3  : unsigned(9 downto 0);
+    signal s_u_diode_b0  : unsigned(9 downto 0);
+    signal s_u_diode_b1  : unsigned(9 downto 0);
+    signal s_u_diode_b2  : unsigned(9 downto 0);
+    signal s_u_diode_b3  : unsigned(9 downto 0);
+    signal s_v_diode_b0  : unsigned(9 downto 0);
+    signal s_v_diode_b1  : unsigned(9 downto 0);
+    signal s_v_diode_b2  : unsigned(9 downto 0);
+    signal s_v_diode_b3  : unsigned(9 downto 0);
+
+    -- Bank index combinational compute + registered for S3 use.
+    -- cv_global upper bits select base bank; Toggle 10 biases the range
+    -- (Soft = 0..2, Hard = 1..3); sigma-delta dither between adjacent
+    -- banks from cv_global lower bits gives smooth transitions.
+    signal s_diode_dither_acc  : unsigned(3 downto 0) := (others => '0');
+    signal s_diode_bank_idx_d3 : integer range 0 to 3 := 0;
+
+    -- Diode LUT outputs at S4 (post-mux + register) — fed into Stage 3
+    -- at M7, currently drive the wet path directly.
+    signal s_y_diode  : unsigned(9 downto 0);
+    signal s_u_diode  : unsigned(9 downto 0);
+    signal s_v_diode  : unsigned(9 downto 0);
+
+    -- ========================================================================
+    -- Stage 3 (M7): NTSC comb (H + V) + sin/cos hue twist.
+    -- ========================================================================
+
+    -- Companion-piped Y signals to align with s_y_diode at S5 timing.
+    -- s_y_chain_d4 = s_y_chain(6) registered through to S4 (5-cycle delay
+    -- from data_in.y) so the H comb delta is a horizontal high-pass.
+    signal s_y_chain_d1      : std_logic_vector(9 downto 0) := (others => '0');
+    signal s_y_chain_d2      : std_logic_vector(9 downto 0) := (others => '0');
+    signal s_y_chain_d3      : std_logic_vector(9 downto 0) := (others => '0');
+    signal s_y_chain_d4      : std_logic_vector(9 downto 0) := (others => '0');
+    -- Companion-piped s_y_prev to align with s_y_diode at S5 timing.
+    -- s_y_prev arrives at S2 (1-cycle BRAM read + 1-cycle output reg) so
+    -- needs 2 more register stages to reach S4.
+    signal s_y_prev_d3       : unsigned(9 downto 0) := (others => '0');
+    signal s_y_prev_d4       : unsigned(9 downto 0) := (others => '0');
+
+    -- Pre-comb Y at S4 (= s_y_diode) re-registered to S5 for the inject
+    -- alignment (delta computed at S5; UV inject happens at S6).
+    signal s_y_diode_d5      : unsigned(9 downto 0) := (others => '0');
+    -- Diode UV companion-piped through to S6 to align with the comb delta.
+    signal s_u_diode_d5      : unsigned(9 downto 0) := (others => '0');
+    signal s_v_diode_d5      : unsigned(9 downto 0) := (others => '0');
+
+    -- Comb delta (signed, registered at S5).  Includes Knob 4 shift table
+    -- + sigma-delta dither.
+    signal s_comb_dither_acc : unsigned(6 downto 0) := (others => '0');
+    signal s_comb_shift_eff  : integer range 0 to 7 := 0;
+    signal s_comb_delta      : signed(11 downto 0) := (others => '0');
+
+    -- UV-injected output of Stage 3a (S6).
+    signal s_u_combed        : unsigned(9 downto 0);
+    signal s_v_combed        : unsigned(9 downto 0);
+    -- Companion-pipe Y through Stage 3 (no comb processing; Y is just
+    -- delayed to keep alignment with the rotated UV).
+    signal s_y_combed        : unsigned(9 downto 0);
+
+    -- Sin/cos hue twist (S7).  Angle composition + bin lookup combinational
+    -- from s_y_combed at S6, registered at S7.  Rotation applied to UV
+    -- centred around C_CHROMA_MID = 512.
+    signal s_rot_angle       : unsigned(9 downto 0);
+    signal s_rot_bin         : t_rot_bin;
+    signal s_rot_dither_acc  : unsigned(5 downto 0) := (others => '0');
+    signal s_rot_bin_eff     : integer range 0 to 15 := 0;
+
+    -- Intermediate rotation products at S7a (after the first shift-add stage).
+    -- These hold cos*u, sin*u, cos*v, sin*v separately so the second stage
+    -- only does the final sum + clamp.  Splitting the rotation into two
+    -- pipeline stages buys ~13 ns of timing budget (vs all-in-one which
+    -- was failing at ~25 ns critical path).
+    signal s_cos_u_d7a       : signed(13 downto 0) := (others => '0');
+    signal s_sin_u_d7a       : signed(13 downto 0) := (others => '0');
+    signal s_cos_v_d7a       : signed(13 downto 0) := (others => '0');
+    signal s_sin_v_d7a       : signed(13 downto 0) := (others => '0');
+    -- Y companion-pipe through S7a so S7b output keeps Y aligned.
+    signal s_y_combed_d7a    : unsigned(9 downto 0) := (others => '0');
+    signal s_uv_swap_d7a     : std_logic := '0';
+
+    -- Stage 3 output (post-rotation + UV swap), at S7b timing.
+    signal s_y_rot           : unsigned(9 downto 0);
+    signal s_u_rot           : unsigned(9 downto 0);
+    signal s_v_rot           : unsigned(9 downto 0);
+
+    -- ========================================================================
+    -- "Wet" output — at M7 this is the Stage 3 sin/cos rotation output.
+    -- Subsequent milestones layer Stages 4-5 on top.  Master mix
+    -- interpolator arrives at M9; until then output is direct s_*_rot.
     -- ========================================================================
     signal s_wet_y           : unsigned(9 downto 0);
     signal s_wet_u           : unsigned(9 downto 0);
@@ -374,10 +534,21 @@ begin
         end if;
     end process;
 
-    -- s_in_top_half is concurrent — true while current pixel's vcount is
-    -- in the top half of the active frame.
-    s_in_top_half <= '1' when s_vcount < to_unsigned(C_ACTIVE_HALF_HEIGHT, s_vcount'length)
-                          else '0';
+    -- s_in_top_half is REGISTERED (1-cycle lag).  Comparison from a wide
+    -- s_vcount + downstream combinational fan-out into TBC compute and
+    -- envelope accumulators created the critical path at M7 (Fmax 40 MHz
+    -- pre-fix).  Registering breaks the chain at no aesthetic cost since
+    -- s_in_top_half changes only at hsync boundaries (line transitions).
+    p_in_top_half : process(clk)
+    begin
+        if rising_edge(clk) then
+            if s_vcount < to_unsigned(C_ACTIVE_HALF_HEIGHT, s_vcount'length) then
+                s_in_top_half <= '1';
+            else
+                s_in_top_half <= '0';
+            end if;
+        end if;
+    end process;
 
     -- ========================================================================
     -- S0d/e: Per-half luma + edge accumulators.  Sum during active video
@@ -589,8 +760,7 @@ begin
     --   * Per-half envelope CV:   cv_luma_half  (10-bit, scaled << 1)
     --   * Motion proxy (1-clock lag): s_motion_proxy << 2
     --   * Frame-phase drift:      s_phase_drift(15..7)
-    p_tbc_jitter : process(s_y_d0, s_in_top_half, s_cv_luma_top, s_cv_luma_bot,
-                          s_motion_proxy, s_phase_drift, s_jitter_shift_eff)
+    p_tbc_jitter : process(clk)
         variable v_cv_half  : unsigned(9 downto 0);
         variable v_content  : signed(11 downto 0);
         variable v_envelope : signed(11 downto 0);
@@ -600,34 +770,37 @@ begin
         variable v_shifted  : signed(13 downto 0);
         variable v_abs      : unsigned(13 downto 0);
     begin
-        -- Pick the spatial-half CV.
-        if s_in_top_half = '1' then
-            v_cv_half := s_cv_luma_top;
-        else
-            v_cv_half := s_cv_luma_bot;
-        end if;
+        if rising_edge(clk) then
+            -- Pick the spatial-half CV.
+            if s_in_top_half = '1' then
+                v_cv_half := s_cv_luma_top;
+            else
+                v_cv_half := s_cv_luma_bot;
+            end if;
 
-        v_content  := signed(resize(unsigned(s_y_d0), 12)) - to_signed(512, 12);
-        v_envelope := signed(resize(v_cv_half, 12)) sll 1;
-        v_motion   := resize(s_motion_proxy, 12) sll 2;
-        v_drift    := resize(signed("0" & s_phase_drift(15 downto 7)), 12);
+            v_content  := signed(resize(unsigned(s_y_d0), 12)) - to_signed(512, 12);
+            v_envelope := signed(resize(v_cv_half, 12)) sll 1;
+            v_motion   := resize(s_motion_proxy, 12) sll 2;
+            -- s_phase_drift(15..7) is 9-bit unsigned; resize to 12-bit
+            -- unsigned (zero-extend), then cast to signed.  Avoids the
+            -- "0" & slv overload ambiguity flagged in testing-guide.md.
+            v_drift    := signed(resize(s_phase_drift(15 downto 7), 12));
 
-        v_sum     := resize(v_content,  14) + resize(v_envelope, 14)
-                   + resize(v_motion,   14) + resize(v_drift,    14);
-        v_shifted := shift_right(v_sum, s_jitter_shift_eff);
+            v_sum     := resize(v_content,  14) + resize(v_envelope, 14)
+                       + resize(v_motion,   14) + resize(v_drift,    14);
+            v_shifted := shift_right(v_sum, s_jitter_shift_eff);
 
-        -- Take absolute value, clamp to 9 bits (max C_TBC_BASE-able offset
-        -- before underflow concerns: with 1920-pixel buffer we have plenty
-        -- of headroom, but bound by 9-bit just to keep it sane).
-        if v_shifted(13) = '1' then
-            v_abs := unsigned(-v_shifted);
-        else
-            v_abs := unsigned(v_shifted);
-        end if;
-        if v_abs > to_unsigned(511, 14) then
-            s_tbc_offset <= to_unsigned(511, 9);
-        else
-            s_tbc_offset <= v_abs(8 downto 0);
+            -- Take absolute value, clamp to 9 bits.
+            if v_shifted(13) = '1' then
+                v_abs := unsigned(-v_shifted);
+            else
+                v_abs := unsigned(v_shifted);
+            end if;
+            if v_abs > to_unsigned(511, 14) then
+                s_tbc_offset <= to_unsigned(511, 9);
+            else
+                s_tbc_offset <= v_abs(8 downto 0);
+            end if;
         end if;
     end process;
 
@@ -746,12 +919,385 @@ begin
     end process;
 
     -- ========================================================================
-    -- M5 wet path: Stage 1 BRAM TBC tap.  Subsequent milestones layer
-    -- Stages 2-5 on top.  Master mix interpolator arrives at M9.
+    -- S3: Diode wavefolder LUT reads.  Y-side: 4 ROMs each read once at
+    -- s_y_tbc(9..2).  UV-side: 4 ROMs each read TWICE (U + V channels) —
+    -- relies on Yosys mapping this as dual-port ROM (1 EBR per bank).
+    -- If Yosys replicates instead, we get 12 EBR for Stage 2 vs 8
+    -- expected; will refactor in that case.
     -- ========================================================================
-    s_wet_y <= s_y_tbc;
-    s_wet_u <= s_u_tbc;
-    s_wet_v <= s_v_tbc;
+
+    -- Y bank reads (4 processes, 1 read port each)
+    p_rd_lut_y0 : process(clk) begin
+        if rising_edge(clk) then
+            s_y_diode_b0 <= lut_y_b0(to_integer(s_y_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_y1 : process(clk) begin
+        if rising_edge(clk) then
+            s_y_diode_b1 <= lut_y_b1(to_integer(s_y_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_y2 : process(clk) begin
+        if rising_edge(clk) then
+            s_y_diode_b2 <= lut_y_b2(to_integer(s_y_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_y3 : process(clk) begin
+        if rising_edge(clk) then
+            s_y_diode_b3 <= lut_y_b3(to_integer(s_y_tbc(9 downto 2)));
+        end if;
+    end process;
+
+    -- UV bank reads — 8 processes (4 banks × 2 channels), shared storage
+    p_rd_lut_u0 : process(clk) begin
+        if rising_edge(clk) then
+            s_u_diode_b0 <= lut_uv_b0(to_integer(s_u_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_v0 : process(clk) begin
+        if rising_edge(clk) then
+            s_v_diode_b0 <= lut_uv_b0(to_integer(s_v_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_u1 : process(clk) begin
+        if rising_edge(clk) then
+            s_u_diode_b1 <= lut_uv_b1(to_integer(s_u_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_v1 : process(clk) begin
+        if rising_edge(clk) then
+            s_v_diode_b1 <= lut_uv_b1(to_integer(s_v_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_u2 : process(clk) begin
+        if rising_edge(clk) then
+            s_u_diode_b2 <= lut_uv_b2(to_integer(s_u_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_v2 : process(clk) begin
+        if rising_edge(clk) then
+            s_v_diode_b2 <= lut_uv_b2(to_integer(s_v_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_u3 : process(clk) begin
+        if rising_edge(clk) then
+            s_u_diode_b3 <= lut_uv_b3(to_integer(s_u_tbc(9 downto 2)));
+        end if;
+    end process;
+    p_rd_lut_v3 : process(clk) begin
+        if rising_edge(clk) then
+            s_v_diode_b3 <= lut_uv_b3(to_integer(s_v_tbc(9 downto 2)));
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S2/S3: Diode bank index — sigma-delta dither between adjacent banks
+    -- driven by cv_global lower bits, base bank from upper bits, Toggle 10
+    -- biases the active range (Soft = 0..2, Hard = 1..3).
+    -- ========================================================================
+    p_diode_bank : process(clk)
+        variable v_acc_next : unsigned(4 downto 0);
+        variable v_base_idx : integer range 0 to 3;
+    begin
+        if rising_edge(clk) then
+            -- Sigma-delta accumulator on cv_global lower 4 bits.  When the
+            -- accumulator overflows, advance one bank — perceived smoothly.
+            v_acc_next := ('0' & s_diode_dither_acc) + ('0' & s_cv_global(3 downto 0));
+            s_diode_dither_acc <= v_acc_next(3 downto 0);
+
+            -- Base bank from cv_global bits [9:8] (top 2 bits of 10-bit CV).
+            v_base_idx := to_integer(s_cv_global(9 downto 8));
+            -- Toggle 10 (Diode Base) shifts the active range.
+            if s_diode_base = '1' and v_base_idx < 3 then
+                v_base_idx := v_base_idx + 1;
+            end if;
+
+            -- Dither overflow advances one more bank (clamped at 3).
+            if v_acc_next(4) = '1' and v_base_idx < 3 then
+                s_diode_bank_idx_d3 <= v_base_idx + 1;
+            else
+                s_diode_bank_idx_d3 <= v_base_idx;
+            end if;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S4: Diode LUT bank-select mux + register.  4-way mux selects the
+    -- live bank's output for each channel.
+    -- ========================================================================
+    p_diode_mux : process(clk)
+    begin
+        if rising_edge(clk) then
+            case s_diode_bank_idx_d3 is
+                when 0 =>
+                    s_y_diode <= s_y_diode_b0;
+                    s_u_diode <= s_u_diode_b0;
+                    s_v_diode <= s_v_diode_b0;
+                when 1 =>
+                    s_y_diode <= s_y_diode_b1;
+                    s_u_diode <= s_u_diode_b1;
+                    s_v_diode <= s_v_diode_b1;
+                when 2 =>
+                    s_y_diode <= s_y_diode_b2;
+                    s_u_diode <= s_u_diode_b2;
+                    s_v_diode <= s_v_diode_b2;
+                when others =>
+                    s_y_diode <= s_y_diode_b3;
+                    s_u_diode <= s_u_diode_b3;
+                    s_v_diode <= s_v_diode_b3;
+            end case;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- Stage 3 companion pipes — align s_y_chain(6), s_y_prev with the
+    -- s_y_diode timing at S5.  s_y_chain(6) at clock T is data_in.y[T-7];
+    -- s_y_diode at clock T is data_in.y[T-5] (with TBC + diode processing).
+    -- So they're naturally 2 active samples apart already; the companion
+    -- pipes here just bring s_y_chain into the same pipeline-register
+    -- timing for the comb delta to be a clean clocked subtraction.
+    -- ========================================================================
+    p_stage3_pipes : process(clk)
+    begin
+        if rising_edge(clk) then
+            s_y_chain_d1 <= s_y_chain(6);
+            s_y_chain_d2 <= s_y_chain_d1;
+            s_y_chain_d3 <= s_y_chain_d2;
+            s_y_chain_d4 <= s_y_chain_d3;
+            s_y_prev_d3  <= s_y_prev;
+            s_y_prev_d4  <= s_y_prev_d3;
+            s_y_diode_d5 <= s_y_diode;
+            s_u_diode_d5 <= s_u_diode;
+            s_v_diode_d5 <= s_v_diode;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S5 prep: NTSC comb shift amount + sigma-delta dither (Knob 4).
+    -- ========================================================================
+    p_comb_dither : process(clk)
+        variable v_acc_next : unsigned(7 downto 0);
+        variable v_shift_hi : integer range 0 to 7;
+    begin
+        if rising_edge(clk) then
+            v_acc_next := ('0' & s_comb_dither_acc) +
+                          ('0' & unsigned(registers_in(3)(6 downto 0)));
+            s_comb_dither_acc <= v_acc_next(6 downto 0);
+
+            v_shift_hi := 7 - to_integer(unsigned(registers_in(3)(9 downto 7)));
+            if v_acc_next(7) = '1' and v_shift_hi > 0 then
+                s_comb_shift_eff <= v_shift_hi - 1;
+            else
+                s_comb_shift_eff <= v_shift_hi;
+            end if;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S5: NTSC comb compute.  delta_h = s_y_diode - s_y_chain_d4 (horizontal
+    -- high-pass, ~2-sample edge).  delta_v = s_y_diode - s_y_prev_d4
+    -- (vertical, prev-line same column).  Sum, then shift by Knob 4 scale.
+    -- Pitfall #14: opposite-signed UV inject is required to avoid the
+    -- magenta/green axis collapse — handled at S6.
+    -- ========================================================================
+    p_comb_compute : process(clk)
+        variable v_y_now    : signed(11 downto 0);
+        variable v_y_chain  : signed(11 downto 0);
+        variable v_y_prev   : signed(11 downto 0);
+        variable v_delta_h  : signed(11 downto 0);
+        variable v_delta_v  : signed(11 downto 0);
+        variable v_delta    : signed(11 downto 0);
+    begin
+        if rising_edge(clk) then
+            v_y_now   := signed(resize(s_y_diode,                     12));
+            v_y_chain := signed(resize(unsigned(s_y_chain_d4),        12));
+            v_y_prev  := signed(resize(s_y_prev_d4,                   12));
+
+            v_delta_h := v_y_now - v_y_chain;
+            v_delta_v := v_y_now - v_y_prev;
+            v_delta   := v_delta_h + v_delta_v;
+            -- Scale by Knob 4 shift; signed arithmetic shift_right is OK
+            -- here (single-pass, no multi-frame feedback — pitfall #3
+            -- doesn't apply).
+            s_comb_delta <= shift_right(v_delta, s_comb_shift_eff);
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S6: NTSC UV inject (opposite-signed) + Y companion register.
+    --   s_u_combed = clamp(s_u_diode_d5 + s_comb_delta, 0, 1023)
+    --   s_v_combed = clamp(s_v_diode_d5 - s_comb_delta, 0, 1023)
+    -- Pitfall #14: U gets +delta, V gets -delta to produce hue rotation
+    -- around grey rather than the magenta/green axis.
+    -- ========================================================================
+    p_comb_inject : process(clk)
+        variable v_u_sum : signed(11 downto 0);
+        variable v_v_sum : signed(11 downto 0);
+    begin
+        if rising_edge(clk) then
+            v_u_sum := signed(resize(s_u_diode_d5, 12)) + s_comb_delta;
+            v_v_sum := signed(resize(s_v_diode_d5, 12)) - s_comb_delta;
+            -- Clamp to 10-bit unsigned (pre-rotation; rotation has its
+            -- own clamp at the output).
+            if v_u_sum < 0 then
+                s_u_combed <= (others => '0');
+            elsif v_u_sum > 1023 then
+                s_u_combed <= to_unsigned(1023, 10);
+            else
+                s_u_combed <= unsigned(v_u_sum(9 downto 0));
+            end if;
+            if v_v_sum < 0 then
+                s_v_combed <= (others => '0');
+            elsif v_v_sum > 1023 then
+                s_v_combed <= to_unsigned(1023, 10);
+            else
+                s_v_combed <= unsigned(v_v_sum(9 downto 0));
+            end if;
+            -- Y passes through unchanged at this stage (rotation only
+            -- touches UV; Y is just delayed to maintain alignment).
+            s_y_combed <= s_y_diode_d5;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S7 prep: Sin/cos rotation angle compute + bin lookup (combinational).
+    -- Angle = (s_y_combed + (cv_global << 2) + Knob 3) mod 1024.
+    -- Bin = angle(9 downto 6).  Sigma-delta dither between adjacent bins
+    -- from angle(5 downto 0).
+    -- ========================================================================
+    p_rot_angle : process(s_y_combed, s_cv_global, s_chroma_twist)
+        variable v_angle : unsigned(11 downto 0);
+    begin
+        v_angle := resize(s_y_combed, 12)
+                 + resize(shift_left(s_cv_global, 2), 12)
+                 + resize(s_chroma_twist, 12);
+        -- mod 1024 = lower 10 bits
+        s_rot_angle <= v_angle(9 downto 0);
+    end process;
+
+    p_rot_dither : process(clk)
+        variable v_acc_next : unsigned(6 downto 0);
+        variable v_bin_base : integer range 0 to 15;
+    begin
+        if rising_edge(clk) then
+            -- Sigma-delta accumulator on angle lower 6 bits.
+            v_acc_next := ('0' & s_rot_dither_acc) +
+                          ('0' & s_rot_angle(5 downto 0));
+            s_rot_dither_acc <= v_acc_next(5 downto 0);
+
+            v_bin_base := to_integer(s_rot_angle(9 downto 6));
+            -- Dither overflow advances one bin (wraps 15 → 0).
+            if v_acc_next(6) = '1' then
+                if v_bin_base = 15 then
+                    s_rot_bin_eff <= 0;
+                else
+                    s_rot_bin_eff <= v_bin_base + 1;
+                end if;
+            else
+                s_rot_bin_eff <= v_bin_base;
+            end if;
+        end if;
+    end process;
+
+    -- Bin coefficient lookup — combinational from C_ROT_TABLE constant.
+    s_rot_bin <= C_ROT_TABLE(s_rot_bin_eff);
+
+    -- ========================================================================
+    -- S7a: Sin/cos rotation — first half (compute the 4 shift-add products
+    -- cos*u, sin*u, cos*v, sin*v in parallel and register).  Splitting the
+    -- rotation into two stages keeps the combinational depth per cycle
+    -- under the 13.47 ns budget at 74.25 MHz.  Without this split, Fmax
+    -- was 40.97 MHz (FAIL).
+    -- ========================================================================
+    p_rotation_s7a : process(clk)
+        variable v_u_c, v_v_c       : signed(11 downto 0);
+        variable v_cos_u, v_cos_v   : signed(13 downto 0);
+        variable v_sin_u, v_sin_v   : signed(13 downto 0);
+
+        procedure shift_add_3 (val      : in  signed(11 downto 0);
+                               sa, sb, sc : in integer range 0 to 15;
+                               signs    : in std_logic_vector(2 downto 0);
+                               result   : out signed(13 downto 0)) is
+            variable acc  : signed(13 downto 0);
+            variable t    : signed(13 downto 0);
+        begin
+            acc := (others => '0');
+            t   := resize(shift_right(val, sa), 14);
+            if signs(0) = '1' then acc := acc - t; else acc := acc + t; end if;
+            t   := resize(shift_right(val, sb), 14);
+            if signs(1) = '1' then acc := acc - t; else acc := acc + t; end if;
+            t   := resize(shift_right(val, sc), 14);
+            if signs(2) = '1' then acc := acc - t; else acc := acc + t; end if;
+            result := acc;
+        end procedure;
+    begin
+        if rising_edge(clk) then
+            v_u_c := signed(resize(s_u_combed, 12)) - to_signed(512, 12);
+            v_v_c := signed(resize(s_v_combed, 12)) - to_signed(512, 12);
+
+            shift_add_3(v_u_c, s_rot_bin.cos_a, s_rot_bin.cos_b, s_rot_bin.cos_c,
+                        s_rot_bin.cos_signs, v_cos_u);
+            shift_add_3(v_u_c, s_rot_bin.sin_a, s_rot_bin.sin_b, s_rot_bin.sin_c,
+                        s_rot_bin.sin_signs, v_sin_u);
+            shift_add_3(v_v_c, s_rot_bin.cos_a, s_rot_bin.cos_b, s_rot_bin.cos_c,
+                        s_rot_bin.cos_signs, v_cos_v);
+            shift_add_3(v_v_c, s_rot_bin.sin_a, s_rot_bin.sin_b, s_rot_bin.sin_c,
+                        s_rot_bin.sin_signs, v_sin_v);
+
+            s_cos_u_d7a   <= v_cos_u;
+            s_sin_u_d7a   <= v_sin_u;
+            s_cos_v_d7a   <= v_cos_v;
+            s_sin_v_d7a   <= v_sin_v;
+            s_y_combed_d7a <= s_y_combed;
+            s_uv_swap_d7a <= s_uv_swap;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S7b: Sin/cos rotation — second half (sum the products, add midpoint,
+    -- clamp, UV swap mux, register).  Cleanly meets timing.
+    -- ========================================================================
+    p_rotation_s7b : process(clk)
+        variable v_u_rot, v_v_rot : signed(13 downto 0);
+        variable v_u_out, v_v_out : signed(13 downto 0);
+    begin
+        if rising_edge(clk) then
+            -- u_rot = u_c*cos - v_c*sin;  v_rot = u_c*sin + v_c*cos
+            v_u_rot := s_cos_u_d7a - s_sin_v_d7a;
+            v_v_rot := s_sin_u_d7a + s_cos_v_d7a;
+
+            -- Add midpoint back (signed comparison handles overflow).
+            v_u_out := v_u_rot + to_signed(512, 14);
+            v_v_out := v_v_rot + to_signed(512, 14);
+
+            if s_uv_swap_d7a = '1' then
+                -- Swap U and V.
+                if v_v_out < 0 then s_u_rot <= (others => '0');
+                elsif v_v_out > 1023 then s_u_rot <= to_unsigned(1023, 10);
+                else s_u_rot <= unsigned(v_v_out(9 downto 0)); end if;
+                if v_u_out < 0 then s_v_rot <= (others => '0');
+                elsif v_u_out > 1023 then s_v_rot <= to_unsigned(1023, 10);
+                else s_v_rot <= unsigned(v_u_out(9 downto 0)); end if;
+            else
+                if v_u_out < 0 then s_u_rot <= (others => '0');
+                elsif v_u_out > 1023 then s_u_rot <= to_unsigned(1023, 10);
+                else s_u_rot <= unsigned(v_u_out(9 downto 0)); end if;
+                if v_v_out < 0 then s_v_rot <= (others => '0');
+                elsif v_v_out > 1023 then s_v_rot <= to_unsigned(1023, 10);
+                else s_v_rot <= unsigned(v_v_out(9 downto 0)); end if;
+            end if;
+
+            s_y_rot <= s_y_combed_d7a;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- M7 wet path: Stage 3 sin/cos rotation output.  Subsequent milestones
+    -- layer Stages 4-5 on top.  Master mix interpolator arrives at M9.
+    -- ========================================================================
+    s_wet_y <= s_y_rot;
+    s_wet_u <= s_u_rot;
+    s_wet_v <= s_v_rot;
 
     -- ========================================================================
     -- Output port: broadcast-safe clamp (R1).
