@@ -32,12 +32,22 @@
 -- counts and an input shift-register chain for the fixed NTSC comb tap.
 -- See docs/guides/hardware-constraints.md "BRAM read-port cost".
 --
--- =====  M2 STATUS — SKELETON PASSTHRU  =====
--- This commit lands the entity body with full register decode, sync delay,
--- and R1 output clamp.  Internal data path is currently *passthru* (the
--- dry-path tap wired to data_out).  Subsequent commits add the analysis
--- branch (M3), Stage 1 (M4-M5), Stage 2 diode LUTs (M6), Stage 3 comb +
--- twist (M7), Stage 4 IIR (M8), Stage 5 sync-crush + master mix (M9).
+-- =====  M3 STATUS — ANALYSIS BRANCH ADDED  =====
+-- M2 (skeleton passthru, register decode, sync delay, R1 clamp) shipped
+-- at commit d2ccea1.  This commit lands the analysis branch:
+--   * Dual envelope follower (luma mean + edge energy, top/bottom split)
+--     with vsync-latched peak-hold + bit-shifted leak.
+--   * vcount counter (reset on vsync_falling, increment on hsync_falling).
+--   * Spatial-half flag (s_in_top_half = vcount < ACTIVE_HEIGHT/2).
+--   * Frame-phase drift accumulator via SDK frame_phase_accumulator.
+--   * Combined cv_global = max(top, bot) >> 1.
+-- The CVs are computed but NOT consumed by the data path yet — Yosys will
+-- tree-shake them at M3.  M4 wires cv_luma_half into TBC jitter compute,
+-- M6 wires cv_global into diode bank select, M9 wires cv_global into tape
+-- noise gain and sync-crush rate.  Internal data path is still the M2
+-- dry-tap passthru.  Subsequent commits add Stage 1 (M4-M5), Stage 2
+-- diode LUTs (M6), Stage 3 comb + twist (M7), Stage 4 IIR (M8), Stage 5
+-- sync-crush + master mix (M9).
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -73,6 +83,20 @@ architecture sync_bleed of program_top is
     constant C_BUF_SIZE      : integer := 2048;
     constant C_BUF_DEPTH     : integer := 11;
     constant C_PREV_OFFSET   : integer := 1920;     -- prev-line tap offset
+
+    -- Active video frame dimensions (1080p).  Used for spatial-half flag
+    -- and envelope accumulator divisor.  Resolution-dependent — pitfall #5.
+    constant C_ACTIVE_HEIGHT      : integer := 1080;
+    constant C_ACTIVE_HALF_HEIGHT : integer := 540;
+    -- Half-frame pixel count = 1920 × 540 ≈ 2^20.  Right-shift the
+    -- accumulator by this to get a ~10-bit mean.  Pitfall #5 risk: at
+    -- sim resolution (480 × 270 ≈ 2^17) this gives smaller CVs.  Live
+    -- with it for V1; document in test-plan.
+    constant C_AVG_SHIFT          : integer := 20;
+
+    -- Envelope accumulator width.  1920 × 540 × 1023 ≈ 1.06e9 < 2^30, so
+    -- 32 bits gives comfortable headroom.
+    constant C_ENV_ACC_WIDTH      : integer := 32;
 
     -- Centred-unsigned chroma neutral (idiom #1 — pitfalls #2, #15).
     constant C_CHROMA_MID    : unsigned(9 downto 0) := to_unsigned(512, 10);
@@ -125,6 +149,40 @@ architecture sync_bleed of program_top is
     -- ========================================================================
     signal s_y_d_prev_pix    : unsigned(9 downto 0) := (others => '0');
     signal s_edge_d0         : unsigned(9 downto 0) := (others => '0');
+
+    -- ========================================================================
+    -- Analysis branch (M3) — dual envelope follower, top/bottom spatial split.
+    -- ========================================================================
+
+    -- vcount: line counter within the active frame.  Reset on vsync_falling,
+    -- increment on hsync_falling.  Sized for 1080 + headroom (11 bits = 2047).
+    signal s_vcount          : unsigned(10 downto 0) := (others => '0');
+    signal s_in_top_half     : std_logic;
+
+    -- Per-half luma + edge accumulators.  Reset on vsync_falling, summed
+    -- during avid in the appropriate half.
+    signal s_luma_acc_top    : unsigned(C_ENV_ACC_WIDTH - 1 downto 0) := (others => '0');
+    signal s_luma_acc_bot    : unsigned(C_ENV_ACC_WIDTH - 1 downto 0) := (others => '0');
+    signal s_edge_acc_top    : unsigned(C_ENV_ACC_WIDTH - 1 downto 0) := (others => '0');
+    signal s_edge_acc_bot    : unsigned(C_ENV_ACC_WIDTH - 1 downto 0) := (others => '0');
+
+    -- Vsync-latched + peak-held + leaked CVs.  10 bits each (matched to
+    -- knob/slider scale, easy to consume downstream).
+    signal s_cv_luma_top     : unsigned(9 downto 0) := (others => '0');
+    signal s_cv_luma_bot     : unsigned(9 downto 0) := (others => '0');
+    signal s_cv_edge_top     : unsigned(9 downto 0) := (others => '0');
+    signal s_cv_edge_bot     : unsigned(9 downto 0) := (others => '0');
+
+    -- Combined global CV: max of top vs bottom (luma+edge sum), halved to
+    -- fit 10 bits.  Used by stages that need a single CV (diode bank
+    -- select, sync-crush rate, tape noise gain).
+    signal s_cv_global       : unsigned(9 downto 0);
+
+    -- Frame-phase drift — 16-bit DDS phase, advances at frame rate.  Speed
+    -- = (cv_global + envelope_react) >> 4 so phase advance is envelope-
+    -- modulated (busy frames drift faster).
+    signal s_phase_drift     : unsigned(15 downto 0);
+    signal s_phase_speed     : unsigned(9 downto 0);
 
     -- ========================================================================
     -- Sync delay outputs — 18-cycle dry-path taps for output and the
@@ -222,6 +280,151 @@ begin
             end if;
         end if;
     end process;
+
+    -- ========================================================================
+    -- S0c: vcount — line counter within active frame.  Reset on
+    -- vsync_falling, increment on hsync_falling.
+    -- ========================================================================
+    p_vcount : process(clk)
+    begin
+        if rising_edge(clk) then
+            if s_timing.vsync_start = '1' then
+                s_vcount <= (others => '0');
+            elsif s_timing.hsync_start = '1' then
+                s_vcount <= s_vcount + 1;
+            end if;
+        end if;
+    end process;
+
+    -- s_in_top_half is concurrent — true while current pixel's vcount is
+    -- in the top half of the active frame.
+    s_in_top_half <= '1' when s_vcount < to_unsigned(C_ACTIVE_HALF_HEIGHT, s_vcount'length)
+                          else '0';
+
+    -- ========================================================================
+    -- S0d/e: Per-half luma + edge accumulators.  Sum during active video
+    -- in whichever half the current pixel lies; reset all four on
+    -- vsync_falling AFTER the per-half latch step below.
+    -- ========================================================================
+    p_envelope_acc : process(clk)
+        variable v_luma_top_mean : unsigned(C_ENV_ACC_WIDTH - 1 downto 0);
+        variable v_luma_bot_mean : unsigned(C_ENV_ACC_WIDTH - 1 downto 0);
+        variable v_edge_top_mean : unsigned(C_ENV_ACC_WIDTH - 1 downto 0);
+        variable v_edge_bot_mean : unsigned(C_ENV_ACC_WIDTH - 1 downto 0);
+        variable v_leak_y_top    : unsigned(9 downto 0);
+        variable v_leak_y_bot    : unsigned(9 downto 0);
+        variable v_leak_e_top    : unsigned(9 downto 0);
+        variable v_leak_e_bot    : unsigned(9 downto 0);
+        variable v_lat_y_top     : unsigned(9 downto 0);
+        variable v_lat_y_bot     : unsigned(9 downto 0);
+        variable v_lat_e_top     : unsigned(9 downto 0);
+        variable v_lat_e_bot     : unsigned(9 downto 0);
+    begin
+        if rising_edge(clk) then
+            if s_timing.vsync_start = '1' then
+                -- Latch the per-half means by shifting accumulator down to
+                -- 10-bit data range.  C_AVG_SHIFT = 20 → ÷2^20 ≈ ÷(half-frame
+                -- pixel count).  Imprecise but bounded; used as a CV, not
+                -- a computed mean.
+                v_luma_top_mean := shift_right(s_luma_acc_top, C_AVG_SHIFT);
+                v_luma_bot_mean := shift_right(s_luma_acc_bot, C_AVG_SHIFT);
+                v_edge_top_mean := shift_right(s_edge_acc_top, C_AVG_SHIFT);
+                v_edge_bot_mean := shift_right(s_edge_acc_bot, C_AVG_SHIFT);
+
+                -- Clamp to 10-bit (lower 10 bits of each mean).
+                v_lat_y_top := v_luma_top_mean(9 downto 0);
+                v_lat_y_bot := v_luma_bot_mean(9 downto 0);
+                v_lat_e_top := v_edge_top_mean(9 downto 0);
+                v_lat_e_bot := v_edge_bot_mean(9 downto 0);
+
+                -- Leak: cv_old - (cv_old >> 8) ≈ 99.6% retention per frame.
+                -- At 60fps: half-life ≈ 175 frames ≈ 2.9s.  Adjust shift if
+                -- decay too slow/fast in hardware playtest.
+                v_leak_y_top := s_cv_luma_top - shift_right(s_cv_luma_top, 8);
+                v_leak_y_bot := s_cv_luma_bot - shift_right(s_cv_luma_bot, 8);
+                v_leak_e_top := s_cv_edge_top - shift_right(s_cv_edge_top, 8);
+                v_leak_e_bot := s_cv_edge_bot - shift_right(s_cv_edge_bot, 8);
+
+                -- Peak-hold: max(latched_mean, leaked_old).  Instant attack,
+                -- slow decay.
+                if v_lat_y_top > v_leak_y_top then s_cv_luma_top <= v_lat_y_top;
+                else                                s_cv_luma_top <= v_leak_y_top; end if;
+                if v_lat_y_bot > v_leak_y_bot then s_cv_luma_bot <= v_lat_y_bot;
+                else                                s_cv_luma_bot <= v_leak_y_bot; end if;
+                if v_lat_e_top > v_leak_e_top then s_cv_edge_top <= v_lat_e_top;
+                else                                s_cv_edge_top <= v_leak_e_top; end if;
+                if v_lat_e_bot > v_leak_e_bot then s_cv_edge_bot <= v_lat_e_bot;
+                else                                s_cv_edge_bot <= v_leak_e_bot; end if;
+
+                -- Reset accumulators for the next frame.
+                s_luma_acc_top <= (others => '0');
+                s_luma_acc_bot <= (others => '0');
+                s_edge_acc_top <= (others => '0');
+                s_edge_acc_bot <= (others => '0');
+
+            elsif data_in.avid = '1' then
+                -- Active video: sum into the appropriate half's accumulators.
+                if s_in_top_half = '1' then
+                    s_luma_acc_top <= s_luma_acc_top
+                                      + resize(unsigned(data_in.y), C_ENV_ACC_WIDTH);
+                    s_edge_acc_top <= s_edge_acc_top
+                                      + resize(s_edge_d0, C_ENV_ACC_WIDTH);
+                else
+                    s_luma_acc_bot <= s_luma_acc_bot
+                                      + resize(unsigned(data_in.y), C_ENV_ACC_WIDTH);
+                    s_edge_acc_bot <= s_edge_acc_bot
+                                      + resize(s_edge_d0, C_ENV_ACC_WIDTH);
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- Combined global CV: max of (luma + edge) per half, halved to 10-bit.
+    -- 11-bit intermediate to avoid overflow on the sum.
+    p_cv_global : process(clk)
+        variable v_top_sum : unsigned(10 downto 0);
+        variable v_bot_sum : unsigned(10 downto 0);
+        variable v_max_sum : unsigned(10 downto 0);
+    begin
+        if rising_edge(clk) then
+            v_top_sum := resize(s_cv_luma_top, 11) + resize(s_cv_edge_top, 11);
+            v_bot_sum := resize(s_cv_luma_bot, 11) + resize(s_cv_edge_bot, 11);
+            if v_top_sum > v_bot_sum then v_max_sum := v_top_sum;
+            else                          v_max_sum := v_bot_sum; end if;
+            -- ÷2 → 10-bit.  Saturates at 1023 if both halves fully bright +
+            -- edge-saturated, which is fine.
+            s_cv_global <= v_max_sum(10 downto 1);
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- Frame-phase drift — SDK frame_phase_accumulator instance.
+    -- Speed = (cv_global + envelope_react) >> 4: envelope-modulated drift.
+    -- M3 status: declared, advance happens, output not consumed yet.
+    -- ========================================================================
+    p_phase_speed : process(clk)
+        variable v_sum     : unsigned(10 downto 0);
+        variable v_shifted : unsigned(10 downto 0);
+    begin
+        if rising_edge(clk) then
+            v_sum     := resize(s_cv_global, 11) + resize(s_envelope_react, 11);
+            v_shifted := shift_right(v_sum, 4);
+            s_phase_speed <= v_shifted(9 downto 0);
+        end if;
+    end process;
+
+    phase_drift_inst : entity work.frame_phase_accumulator
+        generic map(
+            G_PHASE_WIDTH => 16,
+            G_SPEED_WIDTH => 10
+        )
+        port map(
+            clk     => clk,
+            vsync_n => data_in.vsync_n,
+            enable  => '1',
+            speed   => s_phase_speed,
+            phase   => s_phase_drift
+        );
 
     -- ========================================================================
     -- M2 wet-path stub: just the 18-cycle-delayed clean signal.
