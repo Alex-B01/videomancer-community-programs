@@ -96,62 +96,66 @@ architecture bent_topology of program_top is
     -- Helper functions for grid alpha-blend (B5) and chaos UV saturation (B8)
     -- -------------------------------------------------------------------------
     -- Alpha-blend input pixel toward 1023 (white) by alpha/16. alpha=0 → input passes
-    -- through unchanged; alpha=15 → fully white. Used for Y at grid-on pixels.
+    -- through; alpha=15 → fully white. Single-multiply form (LC-cheap):
+    --   out = in + (target - in) * alpha / 16
+    -- For Y target=1023, signed difference (target - in) is positive (1023 ≥ in for 10-bit),
+    -- so unsigned multiply suffices. Used for Y at grid-on pixels.
     function fn_grid_blend_y(input : std_logic_vector(9 downto 0); alpha : unsigned(3 downto 0))
         return std_logic_vector is
-        variable v_in : integer;
+        variable v_in    : integer;
         variable v_alpha : integer;
+        variable v_diff  : integer;
     begin
         v_in    := to_integer(unsigned(input));
         v_alpha := to_integer(alpha);
-        return std_logic_vector(to_unsigned(
-            (v_in * (16 - v_alpha) + 1023 * v_alpha) / 16, 10));
+        v_diff  := 1023 - v_in;
+        return std_logic_vector(to_unsigned(v_in + (v_diff * v_alpha) / 16, 10));
     end function;
 
-    -- Alpha-blend input pixel toward 512 (neutral grey) by alpha/16. alpha=0 → input
-    -- passes through; alpha=15 → fully neutral. Used for U and V at grid-on pixels so
-    -- that the grid line desaturates the underlying chroma rather than tinting it.
+    -- Alpha-blend input pixel toward 512 (neutral grey) by alpha/16. UV target may be
+    -- above or below input → signed multiply needed. Used for U and V at grid-on pixels.
     function fn_grid_blend_uv(input : std_logic_vector(9 downto 0); alpha : unsigned(3 downto 0))
         return std_logic_vector is
-        variable v_in : integer;
+        variable v_in    : integer;
         variable v_alpha : integer;
+        variable v_diff  : integer;   -- signed
     begin
         v_in    := to_integer(unsigned(input));
         v_alpha := to_integer(alpha);
-        return std_logic_vector(to_unsigned(
-            (v_in * (16 - v_alpha) + 512 * v_alpha) / 16, 10));
+        v_diff  := 512 - v_in;
+        return std_logic_vector(to_unsigned(v_in + (v_diff * v_alpha) / 16, 10));
     end function;
 
     -- Chaos macro UV saturation: scale (uv - 512) by a factor selected from chaos.
-    --   sat_level 0 → 0.5×  (heavy desat — chaos low = mellow)
-    --   sat_level 3 → 1.0×  (passthrough)
-    --   sat_level 7 → 1.75× (boost — chaos high = vivid)
-    -- Cheap shift+add multiply, no `multiplier_s` needed.
-    function fn_chaos_sat(uv : std_logic_vector(9 downto 0); sat_level : unsigned(2 downto 0))
+    -- Shift-only math (no multiplies) — 4 levels selected by top 2 bits of sat_level.
+    --   level 0 (00) → 0.5×  (desat — chaos low = mellow)
+    --   level 1 (01) → 1.0×  (passthrough)
+    --   level 2 (10) → 1.5×  (boost — dev + dev/2)
+    --   level 3 (11) → 2.0×  (heavy boost — dev × 2, will clamp)
+    -- Reduced from 8 levels to 4 to fit LC budget; sigma-delta dither on the
+    -- bottom bit of sat_level smooths the transitions perceptually.
+    function fn_chaos_sat(uv : std_logic_vector(9 downto 0); sat_level : unsigned(1 downto 0))
         return std_logic_vector is
         variable v_in    : integer;
         variable v_dev   : integer;
         variable v_scale : integer;
+        variable v_out   : integer;
     begin
         v_in  := to_integer(unsigned(uv));
         v_dev := v_in - 512;
         case to_integer(sat_level) is
-            when 0      => v_scale := v_dev * 4;    -- 0.5×
-            when 1      => v_scale := v_dev * 5;    -- 0.625×
-            when 2      => v_scale := v_dev * 6;    -- 0.75×
-            when 3      => v_scale := v_dev * 8;    -- 1.0×
-            when 4      => v_scale := v_dev * 10;   -- 1.25×
-            when 5      => v_scale := v_dev * 12;   -- 1.5×
-            when 6      => v_scale := v_dev * 13;   -- 1.625×
-            when others => v_scale := v_dev * 14;   -- 1.75×
+            when 0      => v_scale := v_dev / 2;                     -- 0.5×  (>>1)
+            when 1      => v_scale := v_dev;                          -- 1.0×
+            when 2      => v_scale := v_dev + v_dev / 2;              -- 1.5×
+            when others => v_scale := v_dev + v_dev;                  -- 2.0×
         end case;
-        -- Clamp to [0, 1023] after re-adding midpoint
-        if (512 + v_scale / 8) < 0 then
+        v_out := 512 + v_scale;
+        if v_out < 0 then
             return std_logic_vector(to_unsigned(0, 10));
-        elsif (512 + v_scale / 8) > 1023 then
+        elsif v_out > 1023 then
             return std_logic_vector(to_unsigned(1023, 10));
         else
-            return std_logic_vector(to_unsigned(512 + v_scale / 8, 10));
+            return std_logic_vector(to_unsigned(v_out, 10));
         end if;
     end function;
 
@@ -312,7 +316,7 @@ architecture bent_topology of program_top is
 
     -- B8: Chaos macro signals — chaos drives multiple parameters with progressive scaling
     signal s_chaos           : unsigned(9 downto 0);
-    signal s_chaos_sat       : unsigned(2 downto 0);      -- 0..7 → UV scaling around 512
+    signal s_chaos_sat       : unsigned(1 downto 0);      -- 0..3 → UV scaling around 512 (4 levels, shift-only)
     signal s_chaos_ring_bonus: unsigned(7 downto 0);      -- added to ring amp
     signal s_chaos_warp_bonus: unsigned(5 downto 0);      -- added to displacement
     signal s_ring_amp_eff    : unsigned(9 downto 0);      -- ring_amp + chaos_ring_bonus, clamped
@@ -932,8 +936,8 @@ begin
     --   • V-smear mode: existing BRAM feedback blend (kept as-is below)
     -- =========================================================================
     s_chaos            <= unsigned(registers_in(5));
-    s_chaos_sat        <= s_chaos(9 downto 7);              -- 8 levels (0..7)
-    s_chaos_ring_bonus <= "00" & s_chaos(9 downto 4);       -- 0..63 << 0 = 0..63 added to ring
+    s_chaos_sat        <= s_chaos(9 downto 8);              -- 4 levels (top 2 bits): 0..3
+    s_chaos_ring_bonus <= "00" & s_chaos(9 downto 4);       -- 0..63 added to ring
     s_chaos_warp_bonus <= s_chaos(9 downto 4);              -- 0..63 added to warp displacement
 
     -- Apply chaos UV saturation to crushed UV (combinational, sourced at clock 12)
