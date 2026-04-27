@@ -135,13 +135,9 @@
 --   * 7-stage Y input shift-register chain — declared for M7 fixed comb
 --     tap.  Synthesised in M5 with no consumer (Yosys may prune; comes
 --     alive at M7 NTSC comb compute).
---   * TBC jitter compute combining four modulation sources scaled by
---     Knob 5 (s_tbc_jitter): content-luma deviation, per-half envelope
---     CV, motion proxy (Y_now - Y_prev_line), frame-phase drift.
---     Sigma-delta dither on Knob 5 LSBs (idiom #15).
---   * Motion proxy register: signed(s_y_d2) - signed(s_y_prev), updated
---     at S2.  TBC jitter compute at S1 uses the previous clock's motion
---     proxy (1-pixel pipeline lag, aesthetically irrelevant).
+--   * TBC jitter compute (post-M10 redesign): per-line LFSR-based offset
+--     latched at hsync_start, magnitude scaled by Knob 5 + envelope ×
+--     Knob 6 boost.  See p_tbc_jitter.
 --
 -- Pipeline depth bumped DOWN: was 18 (M2 placeholder for the eventual
 -- master-mix interpolator output), now 3 (S0 input register + S1 BRAM
@@ -212,22 +208,24 @@ architecture sync_bleed of program_top is
     -- BRAM line buffer geometry — 2048 deep covers 1080p active line (1920) + headroom.
     constant C_BUF_SIZE      : integer := 2048;
     constant C_BUF_DEPTH     : integer := 11;
-    constant C_PREV_OFFSET   : integer := 1920;     -- prev-line tap offset
-    constant C_TBC_BASE      : integer := 16;       -- baseline TBC read offset
-                                                    -- (with Knob 5 = 0, read is wr_addr - 16)
+    -- Baseline TBC read offset.  Set to 1 (minimum safe value to avoid
+    -- BRAM read-write race at offset 0) so that with Knob 5 = 0 the wet
+    -- path is effectively aligned with the dry path at the master-mix
+    -- interpolator.  Originally 16 to "simulate analog TBC delay" but
+    -- this produced a visible static right-shift on stills with the
+    -- right-edge wrapping back to the left edge.  Knob 5 (TBC Jitter)
+    -- still adds 0..16 px of dynamic per-line offset on top.
+    constant C_TBC_BASE      : integer := 1;
 
-    -- Active video frame dimensions (1080p).  Used for spatial-half flag
-    -- and envelope accumulator divisor.  Resolution-dependent — pitfall #5.
-    constant C_ACTIVE_HEIGHT      : integer := 1080;
-    constant C_ACTIVE_HALF_HEIGHT : integer := 540;
-    -- Half-frame pixel count = 1920 × 540 ≈ 2^20.  Right-shift the
-    -- accumulator by this to get a ~10-bit mean.  Pitfall #5 risk: at
-    -- sim resolution (480 × 270 ≈ 2^17) this gives smaller CVs.  Live
-    -- with it for V1; document in test-plan.
-    constant C_AVG_SHIFT          : integer := 20;
+    -- Active video frame dimensions.  Spatial-half boundary and the
+    -- envelope-accumulator divisor are now derived at runtime from the
+    -- live video timing (see s_active_half_height_dyn and
+    -- s_avg_shift_dyn below) so the program is resolution-portable
+    -- across all supported video modes — pitfall #5 mitigation.
 
-    -- Envelope accumulator width.  1920 × 540 × 1023 ≈ 1.06e9 < 2^30, so
-    -- 32 bits gives comfortable headroom.
+    -- Envelope accumulator width.  Worst-case half-frame at 1080p is
+    -- 1920 × 540 × 1023 ≈ 1.06e9 < 2^30, so 32 bits gives comfortable
+    -- headroom for any supported mode.
     constant C_ENV_ACC_WIDTH      : integer := 32;
 
     -- Centred-unsigned chroma neutral (idiom #1 — pitfalls #2, #15).
@@ -326,12 +324,32 @@ architecture sync_bleed of program_top is
 
     -- Resolution-aware divisor for the envelope accumulator.  Counts
     -- active pixels in the top spatial half each frame; the priority-
-    -- encoded MSB position gives log2(half-frame-pixels) ≈ correct
-    -- shift amount for any video mode + decimation.  Defaults to 20
-    -- (1080p hardware) so the first frame works before the count
-    -- latches.  Pitfall #5 mitigation.
+    -- encoded MSB position + 1 gives ceil(log2(half-frame-pixels)) =
+    -- the correct shift amount for any video mode + decimation.
+    -- Defaults to 20 (1080p hardware) so the first frame works before
+    -- the count latches.  Pitfall #5 mitigation.
     signal s_pixel_count_top : unsigned(23 downto 0) := (others => '0');
     signal s_avg_shift_dyn   : integer range 4 to 24 := 20;
+
+    -- Resolution-aware spatial-half boundary.  Latched from s_vcount at
+    -- each vsync_start = total active row count of the just-completed
+    -- frame; halved for the s_in_top_half comparison.  Default 540 so
+    -- the first frame after reset uses 1080p calibration; settles to
+    -- the correct value after the first complete frame.  Pitfall #5
+    -- mitigation alongside s_avg_shift_dyn.
+    signal s_active_half_height_dyn : unsigned(10 downto 0)
+                                      := to_unsigned(540, 11);
+
+    -- Resolution-aware prev-line tap offset for the BRAM ring buffer.
+    -- Latched from a per-line active-pixel counter at hsync_start =
+    -- active pixel count of the just-completed line.  The NTSC comb's
+    -- vertical delta tap (s_y_prev) reads at wr_addr - this value, so
+    -- it lands on the same column from the previous active line at
+    -- any video mode.  Default 1920 = 1080p line length.  Pitfall #5.
+    signal s_pixels_per_line     : unsigned(C_BUF_DEPTH - 1 downto 0)
+                                   := (others => '0');
+    signal s_prev_offset_dyn     : unsigned(C_BUF_DEPTH - 1 downto 0)
+                                   := to_unsigned(1920, C_BUF_DEPTH);
 
     -- ========================================================================
     -- Stage 1 (M4-M5): registered inputs, BRAM, shift-register chain.
@@ -381,13 +399,6 @@ architecture sync_bleed of program_top is
     signal s_y_prev          : unsigned(9 downto 0);
     signal s_u_tbc           : unsigned(9 downto 0);
     signal s_v_tbc           : unsigned(9 downto 0);
-
-    -- Motion proxy: signed(s_y_d2) − signed(s_y_prev), updated at S2 timing.
-    -- TBC jitter compute at S1 reads the previous clock's value (1-pixel
-    -- pipeline lag, aesthetically irrelevant — "more motion → more tear").
-    signal s_y_d1            : std_logic_vector(9 downto 0) := (others => '0');
-    signal s_y_d2            : std_logic_vector(9 downto 0) := (others => '0');
-    signal s_motion_proxy    : signed(10 downto 0) := (others => '0');
 
     -- Computed TBC offset — REGISTERED at end of S0 to break the
     -- combinational chain s_in_top_half → cv mux → adds/shifts → rd_addr
@@ -736,10 +747,11 @@ begin
     -- envelope accumulators created the critical path at M7 (Fmax 40 MHz
     -- pre-fix).  Registering breaks the chain at no aesthetic cost since
     -- s_in_top_half changes only at hsync boundaries (line transitions).
+    -- Compares against the runtime-derived half height (pitfall #5).
     p_in_top_half : process(clk)
     begin
         if rising_edge(clk) then
-            if s_vcount < to_unsigned(C_ACTIVE_HALF_HEIGHT, s_vcount'length) then
+            if s_vcount < s_active_half_height_dyn then
                 s_in_top_half <= '1';
             else
                 s_in_top_half <= '0';
@@ -747,29 +759,47 @@ begin
         end if;
     end process;
 
-    -- ========================================================================
-    -- S0d (resolution-aware): count active pixels in the top spatial half
-    -- and derive log2(count) as the dynamic envelope-divisor shift.  This
-    -- replaces the static C_AVG_SHIFT=20 (which was calibrated only for
-    -- 1080p hardware and broke at sim decim — pitfall #5).
-    --
-    -- The priority encoder finds the MSB position of the just-completed
-    -- frame's top-half pixel count.  Updated once per frame at vsync_start.
-    -- Default = 20 so the first frame uses 1080p calibration.
-    -- ========================================================================
-    p_avg_shift_runtime : process(clk)
-        variable v_shift : integer range 4 to 24;
+    -- Latch the just-completed frame's active row count and halve it
+    -- for the spatial-split comparison.  At vsync_start, s_vcount holds
+    -- the full row count; shift_right by 1 gives the midpoint.  Used
+    -- by p_in_top_half to drive the spatial-half flag.
+    p_active_half_runtime : process(clk)
     begin
         if rising_edge(clk) then
             if s_timing.vsync_start = '1' then
-                v_shift := 4;
+                s_active_half_height_dyn <= shift_right(s_vcount, 1);
+            end if;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S0d (resolution-aware): count active pixels in the top spatial half
+    -- and derive log2(count) as the dynamic envelope-divisor shift.  This
+    -- is the runtime-derived equivalent of a static `÷ half-frame-pixels`
+    -- and is the program's pitfall #5 mitigation for the envelope
+    -- accumulator.
+    --
+    -- The priority encoder finds the MSB position of the just-completed
+    -- frame's top-half pixel count.  Updated once per frame at vsync_start.
+    -- Default = 20 so the first frame after reset uses 1080p calibration.
+    -- ========================================================================
+    p_avg_shift_runtime : process(clk)
+        variable v_msb : integer range 4 to 23;
+    begin
+        if rising_edge(clk) then
+            if s_timing.vsync_start = '1' then
+                -- Find the MSB position of the just-completed frame's
+                -- half-frame pixel count.  Use MSB + 1 (= ceil(log2(N)))
+                -- as the divisor shift so the truncated mean fits in 10
+                -- bits without overflow at peak frames.
+                v_msb := 4;
                 for i in 23 downto 4 loop
                     if s_pixel_count_top(i) = '1' then
-                        v_shift := i;
+                        v_msb := i;
                         exit;
                     end if;
                 end loop;
-                s_avg_shift_dyn   <= v_shift;
+                s_avg_shift_dyn   <= v_msb + 1;
                 s_pixel_count_top <= (others => '0');
             elsif data_in.avid = '1' and s_in_top_half = '1' then
                 s_pixel_count_top <= s_pixel_count_top + 1;
@@ -798,12 +828,11 @@ begin
     begin
         if rising_edge(clk) then
             if s_timing.vsync_start = '1' then
-                -- Latch the per-half means by shifting accumulator down to
-                -- 10-bit data range.  C_AVG_SHIFT = 20 → ÷2^20 ≈ ÷(half-frame
-                -- pixel count).  Imprecise but bounded; used as a CV, not
-                -- a computed mean.
-                -- Use s_avg_shift_dyn (resolution-aware) instead of static
-                -- C_AVG_SHIFT; pitfall #5 mitigation.
+                -- Latch the per-half means by shifting accumulator down
+                -- to 10-bit data range.  s_avg_shift_dyn = log2(half-frame
+                -- pixel count), derived at runtime per video mode/decim
+                -- (see p_avg_shift_runtime — pitfall #5 mitigation).
+                -- Imprecise but bounded; used as a CV, not a precise mean.
                 v_luma_top_mean := shift_right(s_luma_acc_top, s_avg_shift_dyn);
                 v_luma_bot_mean := shift_right(s_luma_acc_bot, s_avg_shift_dyn);
                 v_edge_top_mean := shift_right(s_edge_acc_top, s_avg_shift_dyn);
@@ -906,8 +935,7 @@ begin
 
     -- ========================================================================
     -- S0: Input register — separates data_in from downstream combinational
-    -- logic.  Companion-pipes data_in to track BRAM read pipeline timing
-    -- for motion proxy (s_y_d2 vs s_y_prev at S2).
+    -- logic.
     -- ========================================================================
     p_input_reg : process(clk)
     begin
@@ -916,8 +944,6 @@ begin
             s_u_d0    <= data_in.u;
             s_v_d0    <= data_in.v;
             s_avid_d0 <= data_in.avid;
-            s_y_d1    <= s_y_d0;        -- companion pipe for motion proxy
-            s_y_d2    <= s_y_d1;
         end if;
     end process;
 
@@ -979,18 +1005,9 @@ begin
         end if;
     end process;
 
-    -- TBC jitter compute (combinational at S0).  Combines four modulation
-    -- sources, all scaled by the dithered Knob 5 shift amount.  Result is
-    -- clamped to non-negative 9-bit so the BRAM read at wr_addr - C_TBC_BASE
-    -- - s_tbc_offset never reads "into the future".
-    --
-    -- Sources:
-    --   * Content luma deviation: s_y_d0 - 512  (signed 11-bit, [-512, 511])
-    --   * Per-half envelope CV:   cv_luma_half  (10-bit, scaled << 1)
-    --   * Motion proxy (1-clock lag): s_motion_proxy << 2
-    --   * Frame-phase drift:      s_phase_drift(15..7)
     -- Pre-register the spatial-half CV selection (Fmax fix — see signal
-    -- declaration s_cv_luma_half_d above).
+    -- declaration s_cv_luma_half_d above).  Used by p_k_eff for per-half
+    -- IIR smear modulation.
     p_cv_half_reg : process(clk)
     begin
         if rising_edge(clk) then
@@ -1055,11 +1072,36 @@ begin
     end process;
 
     -- ========================================================================
-    -- S0/S1: BRAM read addresses (combinational from s_wr_addr + jitter).
-    -- All four address arithmetic done in 13-bit signed before truncating
-    -- to the 11-bit BRAM addr (R6 — gravity_bleed pattern).
+    -- S0d (resolution-aware): count active pixels per line; latch at
+    -- hsync_start as the runtime prev-line offset.  Replaces the static
+    -- C_PREV_OFFSET = 1920 so the NTSC comb's vertical delta tap reads
+    -- exactly 1 line back at any video mode + decimation.  At hardware
+    -- 1080p this lands on 1920; at decim=4 it lands on 480.  Default
+    -- 1920 so the first frame after reset uses 1080p calibration.
+    -- Pitfall #5 mitigation alongside s_avg_shift_dyn and
+    -- s_active_half_height_dyn.
     -- ========================================================================
-    p_rd_addrs : process(s_wr_addr, s_tbc_offset)
+    p_prev_offset_runtime : process(clk)
+    begin
+        if rising_edge(clk) then
+            if s_timing.hsync_start = '1' then
+                if s_pixels_per_line /= to_unsigned(0, C_BUF_DEPTH) then
+                    s_prev_offset_dyn <= s_pixels_per_line;
+                end if;
+                s_pixels_per_line <= (others => '0');
+            elsif data_in.avid = '1' then
+                s_pixels_per_line <= s_pixels_per_line + 1;
+            end if;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S0/S1: BRAM read addresses (combinational from s_wr_addr + jitter).
+    -- All four address arithmetic done in 11-bit unsigned (modular,
+    -- wraps mod 2048 = C_BUF_SIZE).  s_prev_offset_dyn is the runtime-
+    -- derived line-length offset (pitfall #5 mitigation).
+    -- ========================================================================
+    p_rd_addrs : process(s_wr_addr, s_tbc_offset, s_prev_offset_dyn)
         variable v_tbc_offset : unsigned(C_BUF_DEPTH - 1 downto 0);
     begin
         v_tbc_offset := to_unsigned(C_TBC_BASE, C_BUF_DEPTH)
@@ -1067,7 +1109,7 @@ begin
         s_rd_addr_tbc_y  <= s_wr_addr - v_tbc_offset;
         s_rd_addr_tbc_u  <= s_wr_addr - v_tbc_offset;
         s_rd_addr_tbc_v  <= s_wr_addr - v_tbc_offset;
-        s_rd_addr_prev_y <= s_wr_addr - to_unsigned(C_PREV_OFFSET, C_BUF_DEPTH);
+        s_rd_addr_prev_y <= s_wr_addr - s_prev_offset_dyn;
     end process;
 
     -- ========================================================================
@@ -1148,23 +1190,6 @@ begin
             s_y_prev <= unsigned(to_01(unsigned(s_y_prev_raw), '0'));
             s_u_tbc  <= unsigned(to_01(unsigned(s_u_tbc_raw),  '0'));
             s_v_tbc  <= unsigned(to_01(unsigned(s_v_tbc_raw),  '0'));
-        end if;
-    end process;
-
-    -- ========================================================================
-    -- S2: Motion proxy register — signed(s_y_d2) - signed(s_y_prev).
-    -- Updated each clock; consumed by p_tbc_jitter at S0 of the NEXT
-    -- clock (1-pixel pipeline lag).  s_y_prev arrives at S2 from BRAM,
-    -- s_y_d2 is data_in companion-piped to match.
-    -- ========================================================================
-    p_motion_proxy : process(clk)
-        variable v_y_now  : signed(10 downto 0);
-        variable v_y_prev : signed(10 downto 0);
-    begin
-        if rising_edge(clk) then
-            v_y_now  := signed(resize(unsigned(s_y_d2), 11));
-            v_y_prev := signed(resize(s_y_prev,        11));
-            s_motion_proxy <= v_y_now - v_y_prev;
         end if;
     end process;
 
@@ -1786,20 +1811,23 @@ begin
     --   on  (1): dark outlines  (edge subtracts from Y).
     -- ========================================================================
     p_smear_reg : process(clk)
-        variable v_y_iir              : signed(11 downto 0);
-        variable v_y_in               : signed(11 downto 0);
-        variable v_y_smear            : signed(11 downto 0);
-        variable v_edge               : signed(11 downto 0);
-        variable v_edge_sh            : signed(11 downto 0);
-        variable v_y_sum              : signed(11 downto 0);
+        -- 14-bit signed throughout: v_y_smear in AC mode reaches ~2*input
+        -- (max ~2046), and the boosted v_edge_sh adds another ±1023 — sum
+        -- up to ~3000 must not wrap before the final clamp catches it.
+        variable v_y_iir              : signed(13 downto 0);
+        variable v_y_in               : signed(13 downto 0);
+        variable v_y_smear            : signed(13 downto 0);
+        variable v_edge               : signed(13 downto 0);
+        variable v_edge_sh            : signed(13 downto 0);
+        variable v_y_sum              : signed(13 downto 0);
         variable v_env_boost          : integer range 0 to 2;
         variable v_ring_shift_pixel   : integer range 0 to 15;
     begin
         if rising_edge(clk) then
             -- Apply AC/DC at the smear contribution.  v_y_smear is the
             -- value that gets the edge-ringing add and the final clamp.
-            v_y_iir := signed(resize(s_iir_y_out, 12));
-            v_y_in  := signed(resize(s_y_rot_d10, 12));
+            v_y_iir := signed(resize(s_iir_y_out, 14));
+            v_y_in  := signed(resize(s_y_rot_d10, 14));
             if s_ac_dc = '1' then
                 -- AC: mirror state around input.  output = 2*input − state.
                 v_y_smear := shift_left(v_y_in, 1) - v_y_iir;
@@ -1826,7 +1854,14 @@ begin
             if v_ring_shift_pixel < 1 then
                 v_ring_shift_pixel := 1;
             end if;
-            v_edge    := signed(resize(s_edge_pipe(C_EDGE_PIPE_LEN - 1), 12));
+            -- 2× edge boost (shift_left 1) before the Knob 2 attenuation.
+            -- Natural images have soft adjacent-pixel deltas (5..30) which
+            -- the original mid-Knob-2 shift = 7 rounded to ~0; Toggle 8
+            -- (Edge Phase Invert) had nothing to flip.  Doubling the edge
+            -- magnitude here lets soft edges register at moderate Knob 2
+            -- settings while preserving Knob 2 = 0 → silent (shift = 15
+            -- still drops a 2× boosted edge to ~0).
+            v_edge    := shift_left(signed(resize(s_edge_pipe(C_EDGE_PIPE_LEN - 1), 14)), 1);
             v_edge_sh := shift_right(v_edge, v_ring_shift_pixel);
             if s_edge_phase_inv = '1' then
                 v_edge_sh := -v_edge_sh;
