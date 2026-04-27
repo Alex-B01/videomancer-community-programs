@@ -1351,12 +1351,14 @@ begin
     -- magenta/green axis collapse — handled at S6.
     -- ========================================================================
     p_comb_compute : process(clk)
-        variable v_y_now    : signed(11 downto 0);
-        variable v_y_chain  : signed(11 downto 0);
-        variable v_y_prev   : signed(11 downto 0);
-        variable v_delta_h  : signed(11 downto 0);
-        variable v_delta_v  : signed(11 downto 0);
-        variable v_delta    : signed(11 downto 0);
+        variable v_y_now             : signed(11 downto 0);
+        variable v_y_chain           : signed(11 downto 0);
+        variable v_y_prev            : signed(11 downto 0);
+        variable v_delta_h           : signed(11 downto 0);
+        variable v_delta_v           : signed(11 downto 0);
+        variable v_delta             : signed(11 downto 0);
+        variable v_env_boost         : integer range 0 to 2;
+        variable v_comb_shift_pixel  : integer range 0 to 7;
     begin
         if rising_edge(clk) then
             v_y_now   := signed(resize(s_y_diode,                     12));
@@ -1366,10 +1368,33 @@ begin
             v_delta_h := v_y_now - v_y_chain;
             v_delta_v := v_y_now - v_y_prev;
             v_delta   := v_delta_h + v_delta_v;
-            -- Scale by Knob 4 shift; signed arithmetic shift_right is OK
-            -- here (single-pass, no multi-frame feedback — pitfall #3
+
+            -- Knob 6 unlocks an envelope-driven boost on top of Knob 4:
+            -- frames with high cv_global get more visible NTSC comb
+            -- artefacts.  Originally tried gating on cv_edge_half_d but
+            -- at sim resolution the per-half edge accumulator rarely
+            -- reaches its upper bits (even on bars, cv_edge stays around
+            -- 30..50 of 1023).  cv_global aggregates luma+edge across
+            -- both halves and is more likely to engage at sim while still
+            -- being meaningful at hardware.  Pitfall #20 zero-gate:
+            -- env_react = 0 → boost = 0.  Capped at 2 so Knob 4 stays
+            -- primary.
+            v_env_boost := 0;
+            if (s_envelope_react(9) and s_cv_global(9)) = '1' then
+                v_env_boost := v_env_boost + 1;
+            end if;
+            if (s_envelope_react(8) and s_cv_global(8)) = '1' then
+                v_env_boost := v_env_boost + 1;
+            end if;
+            v_comb_shift_pixel := s_comb_shift_eff - v_env_boost;
+            if v_comb_shift_pixel < 0 then
+                v_comb_shift_pixel := 0;
+            end if;
+
+            -- Scale by Knob 4 shift (with env boost); signed shift_right is
+            -- OK here (single-pass, no multi-frame feedback — pitfall #3
             -- doesn't apply).
-            s_comb_delta <= shift_right(v_delta, s_comb_shift_eff);
+            s_comb_delta <= shift_right(v_delta, v_comb_shift_pixel);
         end if;
     end process;
 
@@ -1411,15 +1436,26 @@ begin
 
     -- ========================================================================
     -- S7 prep: Sin/cos rotation angle compute + bin lookup (combinational).
-    -- Angle = (s_y_combed + (cv_global << 2) + Knob 3) mod 1024.
+    -- Angle = (s_y_combed - (cv_global << 2) + Knob 3) mod 1024.
     -- Bin = angle(9 downto 6).  Sigma-delta dither between adjacent bins
     -- from angle(5 downto 0).
+    --
+    -- Envelope SUBTRACTS from the angle (rather than adding) so that bright
+    -- frames rotate hue OPPOSITE to the per-pixel Y-driven rotation.  This
+    -- pulls the hue character "the other way" on energetic content,
+    -- producing more obvious image-modulated colour swings than the
+    -- previous additive design (where Y and cv reinforced each other and
+    -- the visual result felt like a constant hue offset across content).
+    -- Subtraction on unsigned wraps mod 4096 in 12-bit; the lower-10-bit
+    -- mask then takes mod 1024.  No negative values escape, no out-of-
+    -- range index — the angle just lands at different valid bins per
+    -- frame depending on cv.
     -- ========================================================================
     p_rot_angle : process(s_y_combed, s_cv_global, s_chroma_twist)
         variable v_angle : unsigned(11 downto 0);
     begin
         v_angle := resize(s_y_combed, 12)
-                 + resize(shift_left(s_cv_global, 2), 12)
+                 - resize(shift_left(s_cv_global, 2), 12)
                  + resize(s_chroma_twist, 12);
         -- mod 1024 = lower 10 bits
         s_rot_angle <= v_angle(9 downto 0);
@@ -1750,12 +1786,14 @@ begin
     --   on  (1): dark outlines  (edge subtracts from Y).
     -- ========================================================================
     p_smear_reg : process(clk)
-        variable v_y_iir   : signed(11 downto 0);
-        variable v_y_in    : signed(11 downto 0);
-        variable v_y_smear : signed(11 downto 0);
-        variable v_edge    : signed(11 downto 0);
-        variable v_edge_sh : signed(11 downto 0);
-        variable v_y_sum   : signed(11 downto 0);
+        variable v_y_iir              : signed(11 downto 0);
+        variable v_y_in               : signed(11 downto 0);
+        variable v_y_smear            : signed(11 downto 0);
+        variable v_edge               : signed(11 downto 0);
+        variable v_edge_sh            : signed(11 downto 0);
+        variable v_y_sum              : signed(11 downto 0);
+        variable v_env_boost          : integer range 0 to 2;
+        variable v_ring_shift_pixel   : integer range 0 to 15;
     begin
         if rising_edge(clk) then
             -- Apply AC/DC at the smear contribution.  v_y_smear is the
@@ -1771,8 +1809,25 @@ begin
 
             -- Edge ringing: shift the aligned edge magnitude, optionally
             -- negate (Toggle 8), add to Y output.
+            -- Knob 6 unlocks an envelope-driven boost on top of Knob 2:
+            -- when both s_envelope_react upper bits AND s_cv_global upper
+            -- bits are set, reduce the shift by up to 2 (4× louder edge
+            -- ringing on busy frames).  Pitfall #20 zero-gate: env_react
+            -- = 0 → no boost.  Capped at 2 so it never overrides Knob 2's
+            -- primary control.
+            v_env_boost := 0;
+            if (s_envelope_react(9) and s_cv_global(9)) = '1' then
+                v_env_boost := v_env_boost + 1;
+            end if;
+            if (s_envelope_react(8) and s_cv_global(8)) = '1' then
+                v_env_boost := v_env_boost + 1;
+            end if;
+            v_ring_shift_pixel := s_ring_shift_eff - v_env_boost;
+            if v_ring_shift_pixel < 1 then
+                v_ring_shift_pixel := 1;
+            end if;
             v_edge    := signed(resize(s_edge_pipe(C_EDGE_PIPE_LEN - 1), 12));
-            v_edge_sh := shift_right(v_edge, s_ring_shift_eff);
+            v_edge_sh := shift_right(v_edge, v_ring_shift_pixel);
             if s_edge_phase_inv = '1' then
                 v_edge_sh := -v_edge_sh;
             end if;
@@ -1826,8 +1881,13 @@ begin
     end process;
 
     p_tape_noise : process(clk)
-        variable v_noise : signed(9 downto 0);
-        variable v_y_sum : signed(11 downto 0);
+        variable v_noise         : signed(9 downto 0);
+        variable v_y_sum         : signed(11 downto 0);
+        variable v_y_signed      : signed(10 downto 0);
+        variable v_y_dev         : signed(10 downto 0);
+        variable v_y_abs         : unsigned(10 downto 0);
+        variable v_y_extreme     : integer range 0 to 3;
+        variable v_noise_shift   : integer range 0 to 31;
     begin
         if rising_edge(clk) then
             -- Tape noise is Y-domain ONLY (luma graininess).  Adding the
@@ -1838,7 +1898,25 @@ begin
             -- or opposite-signed UV; deferred to V2.
             v_noise := signed(resize(unsigned(s_lfsr_q(15 downto 8)), 10))
                        - to_signed(128, 10);
-            v_noise := shift_right(v_noise, s_noise_amp_shift);
+
+            -- Per-pixel Y-correlation: noise is loudest at midtones
+            -- (where tape grit naturally lives) and quieter at extremes.
+            -- v_y_dev = abs(s_smear_y - 512) → 0 at midtone, 511 at extremes.
+            -- Upper 2 bits give 0..3 of additional shift → up to 8× quieter
+            -- at peak white/black.  Always-on (no env_react gate) — this
+            -- is a character change, not a modulation hookup.  Pitfall #5
+            -- not relevant here: thresholds at Y=384/640 are scene-luma,
+            -- not envelope-CV-derived.
+            v_y_signed := signed(resize(s_smear_y, 11));
+            v_y_dev    := v_y_signed - to_signed(512, 11);
+            if v_y_dev(10) = '1' then
+                v_y_abs := unsigned(-v_y_dev);
+            else
+                v_y_abs := unsigned(v_y_dev);
+            end if;
+            v_y_extreme := to_integer(v_y_abs(8 downto 7));
+            v_noise_shift := s_noise_amp_shift + v_y_extreme;
+            v_noise := shift_right(v_noise, v_noise_shift);
 
             v_y_sum := signed(resize(s_smear_y, 12)) + resize(v_noise, 12);
 
@@ -1878,7 +1956,9 @@ begin
     -- cv_global > C_CRUSH_TH, line_count masked-equal-to-zero, LFSR bit set.
     -- ========================================================================
     p_band_trigger : process(clk)
-        variable v_density_match : boolean;
+        variable v_density_match  : boolean;
+        variable v_threshold_drop : integer range 0 to 127;
+        variable v_eff_threshold  : unsigned(9 downto 0);
     begin
         if rising_edge(clk) then
             if s_timing.vsync_start = '1' then
@@ -1887,10 +1967,22 @@ begin
             elsif s_timing.hsync_start = '1' then
                 v_density_match := (s_line_count(7 downto 0) and s_band_density_mask)
                                    = "00000000";
+
+                -- Knob 6 (Env React) lowers the sync-crush threshold by up
+                -- to 127 LSBs (env_react upper 7 bits = 0..127), so at
+                -- full env_react crush triggers at cv_global > 129 instead
+                -- of > 256.  Pitfall #20 zero-gate: env_react = 0 → drop
+                -- = 0 → effective threshold = C_CRUSH_TH unchanged.
+                -- Range (256..129) keeps the threshold meaningfully
+                -- gated; the original 256..193 (env_react(9:4)) was too
+                -- narrow to validate at sim cv_global magnitudes.
+                v_threshold_drop := to_integer(unsigned(s_envelope_react(9 downto 3)));
+                v_eff_threshold  := to_unsigned(C_CRUSH_TH - v_threshold_drop, 10);
+
                 if s_sync_crush = '1'
                    and s_lfsr_q(0) = '1'
                    and v_density_match
-                   and s_cv_global > to_unsigned(C_CRUSH_TH, 10) then
+                   and s_cv_global > v_eff_threshold then
                     s_band_active <= '1';
                 else
                     s_band_active <= '0';
