@@ -201,6 +201,13 @@ architecture sync_bleed of program_top is
     -- Dry-path tap depth into the master mix interpolator (a-input).
     -- Interpolator is 4 cycles, so dry tap must be at depth 14 = 18 − 4.
     constant C_DRY_TAP_DEPTH         : integer := 14;
+    -- IIR-gate depth — avid and hsync_start gating signals for p_iir_state
+    -- need to align with the IIR's data input (s_y_rot/u_rot/v_rot) at
+    -- depth 10.  Pipeline: S0..S8b = 10 register stages from data_in to
+    -- s_y_rot.  Gating on s_avid_d0 (depth 1) caused 9 cycles of blanking-
+    -- zero data to be processed at line start, dragging UV state to 0
+    -- (= green collapse).  See pitfall #19 in video-fpga-pitfalls.md.
+    constant C_IIR_GATE_DEPTH        : integer := 10;
 
     -- BRAM line buffer geometry — 2048 deep covers 1080p active line (1920) + headroom.
     constant C_BUF_SIZE      : integer := 2048;
@@ -300,8 +307,9 @@ architecture sync_bleed of program_top is
 
     -- Combined global CV: max of top vs bottom (luma+edge sum), halved to
     -- fit 10 bits.  Used by stages that need a single CV (diode bank
-    -- select, sync-crush rate, tape noise gain).
-    signal s_cv_global       : unsigned(9 downto 0);
+    -- select, sync-crush rate, tape noise gain).  Init to 0 so sync-crush
+    -- band trigger (cv > C_CRUSH_TH) doesn't fire on undefined startup.
+    signal s_cv_global       : unsigned(9 downto 0) := (others => '0');
 
     -- Frame-phase drift — 16-bit DDS phase, advances at frame rate.  Speed
     -- = (cv_global + envelope_react) >> 4 so phase advance is envelope-
@@ -315,6 +323,15 @@ architecture sync_bleed of program_top is
     -- invisible: cv_luma_top/bot only update at vsync, so a 1-cycle
     -- register on the spatial-half mux doesn't lag anything visible.
     signal s_cv_luma_half_d  : unsigned(9 downto 0) := (others => '0');
+
+    -- Resolution-aware divisor for the envelope accumulator.  Counts
+    -- active pixels in the top spatial half each frame; the priority-
+    -- encoded MSB position gives log2(half-frame-pixels) ≈ correct
+    -- shift amount for any video mode + decimation.  Defaults to 20
+    -- (1080p hardware) so the first frame works before the count
+    -- latches.  Pitfall #5 mitigation.
+    signal s_pixel_count_top : unsigned(23 downto 0) := (others => '0');
+    signal s_avg_shift_dyn   : integer range 4 to 24 := 20;
 
     -- ========================================================================
     -- Stage 1 (M4-M5): registered inputs, BRAM, shift-register chain.
@@ -427,10 +444,11 @@ architecture sync_bleed of program_top is
     signal s_diode_bank_idx_d3 : integer range 0 to 3 := 0;
 
     -- Diode LUT outputs at S4 (post-mux + register) — fed into Stage 3
-    -- at M7, currently drive the wet path directly.
-    signal s_y_diode  : unsigned(9 downto 0);
-    signal s_u_diode  : unsigned(9 downto 0);
-    signal s_v_diode  : unsigned(9 downto 0);
+    -- at M7.  UV inits to C_CHROMA_MID so transient sim 'U's don't
+    -- propagate into rotation/IIR as green (pitfalls #4, #6).
+    signal s_y_diode  : unsigned(9 downto 0) := (others => '0');
+    signal s_u_diode  : unsigned(9 downto 0) := to_unsigned(512, 10);
+    signal s_v_diode  : unsigned(9 downto 0) := to_unsigned(512, 10);
 
     -- ========================================================================
     -- Stage 3 (M7): NTSC comb (H + V) + sin/cos hue twist.
@@ -462,12 +480,13 @@ architecture sync_bleed of program_top is
     signal s_comb_shift_eff  : integer range 0 to 7 := 0;
     signal s_comb_delta      : signed(11 downto 0) := (others => '0');
 
-    -- UV-injected output of Stage 3a (S6).
-    signal s_u_combed        : unsigned(9 downto 0);
-    signal s_v_combed        : unsigned(9 downto 0);
+    -- UV-injected output of Stage 3a (S6).  Inits to C_CHROMA_MID
+    -- (pitfalls #4, #6).
+    signal s_u_combed        : unsigned(9 downto 0) := to_unsigned(512, 10);
+    signal s_v_combed        : unsigned(9 downto 0) := to_unsigned(512, 10);
     -- Companion-pipe Y through Stage 3 (no comb processing; Y is just
     -- delayed to keep alignment with the rotated UV).
-    signal s_y_combed        : unsigned(9 downto 0);
+    signal s_y_combed        : unsigned(9 downto 0) := (others => '0');
 
     -- Sin/cos hue twist (S7).  Angle composition + bin lookup combinational
     -- from s_y_combed at S6, registered at S7.  Rotation applied to UV
@@ -491,9 +510,13 @@ architecture sync_bleed of program_top is
     signal s_uv_swap_d7a     : std_logic := '0';
 
     -- Stage 3 output (post-rotation + UV swap), at S7b timing.
-    signal s_y_rot           : unsigned(9 downto 0);
-    signal s_u_rot           : unsigned(9 downto 0);
-    signal s_v_rot           : unsigned(9 downto 0);
+    -- Init values to safe defaults so GHDL doesn't propagate 'U' into the
+    -- downstream IIR state at simulation start (pitfall #4).  Y → 0, UV →
+    -- C_CHROMA_MID per pitfall #6 (UV needs more protection — neutral grey
+    -- is safe, 0 would render as green).
+    signal s_y_rot           : unsigned(9 downto 0) := (others => '0');
+    signal s_u_rot           : unsigned(9 downto 0) := C_CHROMA_MID;
+    signal s_v_rot           : unsigned(9 downto 0) := C_CHROMA_MID;
 
     -- ========================================================================
     -- Stage 4 (M8): Capacitor bleed IIR + edge ringing.
@@ -549,8 +572,14 @@ architecture sync_bleed of program_top is
 
     -- Stage 4 output (smear) at S10 timing — drives the wet path at M8.
     signal s_smear_y         : unsigned(9 downto 0) := (others => '0');
-    signal s_smear_u         : unsigned(9 downto 0) := (others => '0');
-    signal s_smear_v         : unsigned(9 downto 0) := (others => '0');
+    signal s_smear_u         : unsigned(9 downto 0) := to_unsigned(512, 10);
+    signal s_smear_v         : unsigned(9 downto 0) := to_unsigned(512, 10);
+
+    -- Companion-pipe of s_y_rot (= IIR's input at S9) through to S10
+    -- so the AC/DC mode at smear register can compute the mirror
+    -- output = 2*input − state.  Two register stages: S9 and S10.
+    signal s_y_rot_d9        : unsigned(9 downto 0) := (others => '0');
+    signal s_y_rot_d10       : unsigned(9 downto 0) := (others => '0');
 
     -- ========================================================================
     -- Stage 5 (M9): Sync-crush bands + tape noise + master mix.
@@ -589,6 +618,13 @@ architecture sync_bleed of program_top is
     -- avid at the interpolator's input — used as enable for the
     -- interpolator instances (4-cycle sync between dry and wet).
     signal s_avid_d14          : std_logic := '0';
+
+    -- IIR-gate signals at depth 10 (matches s_y_rot/u_rot/v_rot data
+    -- timing).  See pitfall #19 — gating the IIR at depth 1 while
+    -- consuming data at depth 10 caused per-line blanking-zero
+    -- contamination of UV state.
+    signal s_avid_d10          : std_logic := '0';
+    signal s_hsync_start_d10   : std_logic := '0';
 
     -- Master mix interpolator outputs at depth 18.
     signal s_interp_y          : unsigned(9 downto 0);
@@ -712,6 +748,36 @@ begin
     end process;
 
     -- ========================================================================
+    -- S0d (resolution-aware): count active pixels in the top spatial half
+    -- and derive log2(count) as the dynamic envelope-divisor shift.  This
+    -- replaces the static C_AVG_SHIFT=20 (which was calibrated only for
+    -- 1080p hardware and broke at sim decim — pitfall #5).
+    --
+    -- The priority encoder finds the MSB position of the just-completed
+    -- frame's top-half pixel count.  Updated once per frame at vsync_start.
+    -- Default = 20 so the first frame uses 1080p calibration.
+    -- ========================================================================
+    p_avg_shift_runtime : process(clk)
+        variable v_shift : integer range 4 to 24;
+    begin
+        if rising_edge(clk) then
+            if s_timing.vsync_start = '1' then
+                v_shift := 4;
+                for i in 23 downto 4 loop
+                    if s_pixel_count_top(i) = '1' then
+                        v_shift := i;
+                        exit;
+                    end if;
+                end loop;
+                s_avg_shift_dyn   <= v_shift;
+                s_pixel_count_top <= (others => '0');
+            elsif data_in.avid = '1' and s_in_top_half = '1' then
+                s_pixel_count_top <= s_pixel_count_top + 1;
+            end if;
+        end if;
+    end process;
+
+    -- ========================================================================
     -- S0d/e: Per-half luma + edge accumulators.  Sum during active video
     -- in whichever half the current pixel lies; reset all four on
     -- vsync_falling AFTER the per-half latch step below.
@@ -736,10 +802,12 @@ begin
                 -- 10-bit data range.  C_AVG_SHIFT = 20 → ÷2^20 ≈ ÷(half-frame
                 -- pixel count).  Imprecise but bounded; used as a CV, not
                 -- a computed mean.
-                v_luma_top_mean := shift_right(s_luma_acc_top, C_AVG_SHIFT);
-                v_luma_bot_mean := shift_right(s_luma_acc_bot, C_AVG_SHIFT);
-                v_edge_top_mean := shift_right(s_edge_acc_top, C_AVG_SHIFT);
-                v_edge_bot_mean := shift_right(s_edge_acc_bot, C_AVG_SHIFT);
+                -- Use s_avg_shift_dyn (resolution-aware) instead of static
+                -- C_AVG_SHIFT; pitfall #5 mitigation.
+                v_luma_top_mean := shift_right(s_luma_acc_top, s_avg_shift_dyn);
+                v_luma_bot_mean := shift_right(s_luma_acc_bot, s_avg_shift_dyn);
+                v_edge_top_mean := shift_right(s_edge_acc_top, s_avg_shift_dyn);
+                v_edge_bot_mean := shift_right(s_edge_acc_bot, s_avg_shift_dyn);
 
                 -- Clamp to 10-bit (lower 10 bits of each mean).
                 v_lat_y_top := v_luma_top_mean(9 downto 0);
@@ -935,37 +1003,53 @@ begin
     end process;
 
     p_tbc_jitter : process(clk)
-        variable v_content  : signed(11 downto 0);
-        variable v_envelope : signed(11 downto 0);
-        variable v_motion   : signed(11 downto 0);
-        variable v_drift    : signed(11 downto 0);
-        variable v_sum      : signed(13 downto 0);
-        variable v_shifted  : signed(13 downto 0);
-        variable v_abs      : unsigned(13 downto 0);
+        variable v_random  : unsigned(3 downto 0);  -- 0..15 from LFSR
+        variable v_knob    : unsigned(3 downto 0);  -- 0..15 from Knob 5
+        variable v_env     : unsigned(3 downto 0);  -- 0..15 from envelope*react
+        variable v_max     : unsigned(4 downto 0);  -- knob+env, clamped below
     begin
         if rising_edge(clk) then
-            v_content  := signed(resize(unsigned(s_y_d0), 12)) - to_signed(512, 12);
-            v_envelope := signed(resize(s_cv_luma_half_d, 12)) sll 1;
-            v_motion   := resize(s_motion_proxy, 12) sll 2;
-            -- s_phase_drift(15..7) is 9-bit unsigned; resize to 12-bit
-            -- unsigned (zero-extend), then cast to signed.  Avoids the
-            -- "0" & slv overload ambiguity flagged in testing-guide.md.
-            v_drift    := signed(resize(s_phase_drift(15 downto 7), 12));
+            -- TBC jitter is a PER-LINE effect.  Real analog TBC errors
+            -- shift whole lines (line-rate timing instability) and
+            -- adjacent lines having different offsets produces the
+            -- characteristic horizontal "tearing" / "wobble".  Per-pixel
+            -- offset variation produces pixel-rate scramble, not tear,
+            -- so the offset is latched at hsync_start to hold constant
+            -- within a line.
+            --
+            -- Each line samples LFSR(3..0) (0..15) and clamps to v_max.
+            -- v_max is derived from BOTH:
+            --   * Knob 5 (TBC Jitter): primary intensity control.
+            --   * Envelope × Knob 6 (Env React): video content modulates
+            --     jitter intensity — bright/active content → more tear.
+            -- This makes the input video itself a modulation source: the
+            -- TBC tear gets stronger when content is bright/edgey.
+            -- s_phase_speed = (cv_global + env_react) >> 4 is the
+            -- pre-computed envelope×react composite (0..127); we take
+            -- its upper 4 bits (0..7) as the env contribution.  Knob 6=0
+            -- masks the env contribution to 0; Knob 6 max boosts v_max
+            -- by up to 7 above the knob 5 setting.
+            if s_timing.hsync_start = '1' then
+                v_random := unsigned(s_lfsr_q(3 downto 0));
+                v_knob   := unsigned(registers_in(4)(9 downto 6));
+                if s_envelope_react(9 downto 6) = "0000" then
+                    v_env := (others => '0');
+                else
+                    v_env := "0" & s_phase_speed(6 downto 4);
+                end if;
+                -- Sum, clamp to 15.
+                v_max := resize(v_knob, 5) + resize(v_env, 5);
+                if v_max > to_unsigned(15, 5) then
+                    v_max := to_unsigned(15, 5);
+                end if;
 
-            v_sum     := resize(v_content,  14) + resize(v_envelope, 14)
-                       + resize(v_motion,   14) + resize(v_drift,    14);
-            v_shifted := shift_right(v_sum, s_jitter_shift_eff);
-
-            -- Take absolute value, clamp to 9 bits.
-            if v_shifted(13) = '1' then
-                v_abs := unsigned(-v_shifted);
-            else
-                v_abs := unsigned(v_shifted);
-            end if;
-            if v_abs > to_unsigned(511, 14) then
-                s_tbc_offset <= to_unsigned(511, 9);
-            else
-                s_tbc_offset <= v_abs(8 downto 0);
+                if unsigned(registers_in(4)) = to_unsigned(0, 10) then
+                    s_tbc_offset <= (others => '0');
+                elsif v_random > v_max(3 downto 0) then
+                    s_tbc_offset <= "00000" & v_max(3 downto 0);
+                else
+                    s_tbc_offset <= "00000" & v_random;
+                end if;
             end if;
         end if;
     end process;
@@ -1489,9 +1573,16 @@ begin
                           ('0' & unsigned(registers_in(0)(6 downto 0)));
             s_k_y_dither_acc <= v_acc_next(6 downto 0);
 
-            -- Base k = 7 - Knob1(9..7).  Raw 0 promoted to 1 (no infinite
-            -- hold).  v_k_base in 0..7.
-            v_k_base := 7 - to_integer(unsigned(registers_in(0)(9 downto 7)));
+            -- Base k = Knob1(9..7).  Raw 0 promoted to 1 below.
+            -- For our signed-IIR form (`state += (input - state) >> k`):
+            --   k=1 → fast tracking = NO smear (state ≈ input)
+            --   k=7 → slow tracking = MAX smear (state stuck on old value)
+            -- So Knob 1 = 0 → k=1 (no smear, light decay) per design intent.
+            -- (NB: gravity_bleed uses the inverted mapping `7 - top3`
+            -- because its unsigned-IIR identity has the opposite k polarity.
+            -- The two forms give the same aesthetic from the same knob;
+            -- only the internal k value differs.)
+            v_k_base := to_integer(unsigned(registers_in(0)(9 downto 7)));
 
             -- Per-half envelope CV — bright/edge-active halves shorten
             -- smear.  v_k_env in 0..7 (cv >> 7 maps 0..1023 to 0..7).
@@ -1576,13 +1667,18 @@ begin
         variable v_delta_v : signed(C_IIR_STATE_WIDTH - 1 downto 0);
     begin
         if rising_edge(clk) then
-            if s_timing.hsync_start = '1' then
-                -- Reset at hsync_falling: Y → 0 (black), UV → 512<<8 (neutral
-                -- grey, pitfall #15 — never 0 for UV).
+            -- Both reset and update gates use depth-10 signals to align
+            -- with s_y_rot/u_rot/v_rot timing (pitfall #19).  Gating on
+            -- depth-1 signals here would cause 9 cycles of blanking-zero
+            -- input per active line → UV state collapses to 0 = green.
+            if s_hsync_start_d10 = '1' then
+                -- Reset at hsync_falling (depth-10 aligned): Y → 0
+                -- (black), UV → 512<<8 (neutral grey, pitfall #15 —
+                -- never 0 for UV).
                 s_iir_y <= (others => '0');
                 s_iir_u <= to_signed(C_IIR_UV_RESET, C_IIR_STATE_WIDTH);
                 s_iir_v <= to_signed(C_IIR_UV_RESET, C_IIR_STATE_WIDTH);
-            elsif s_avid_d0 = '1' then
+            elsif s_avid_d10 = '1' then
                 -- IIR update: state += (input - state) >> k_eff.
                 -- Inputs are 10-bit unsigned, shifted left by
                 -- C_IIR_FRAC_BITS to enter the state's data range
@@ -1604,13 +1700,14 @@ begin
                 v_delta_u := shift_right(v_err_u, s_k_uv_eff);
                 v_delta_v := shift_right(v_err_v, s_k_uv_eff);
 
-                -- AC/DC coupling: Toggle 7 flips Y's delta sign.
-                if s_ac_dc = '1' then
-                    s_iir_y <= s_iir_y - v_delta_y;
-                else
-                    s_iir_y <= s_iir_y + v_delta_y;
-                end if;
-                -- UV always normal polarity (AC/DC affects luma smear only).
+                -- IIR state ALWAYS converges to input (no AC/DC sign flip
+                -- here).  AC/DC is applied at the smear-register stage
+                -- as a MIRROR (output = 2*input − state) which produces
+                -- the "negative shadow-smear" effect without making the
+                -- IIR runaway-unstable.  Earlier versions flipped the
+                -- delta sign in the state-update path; this caused
+                -- state to diverge to ±2^18 (R7 stuck-state violation).
+                s_iir_y <= s_iir_y + v_delta_y;
                 s_iir_u <= s_iir_u + v_delta_u;
                 s_iir_v <= s_iir_v + v_delta_v;
             end if;
@@ -1623,30 +1720,65 @@ begin
     s_iir_v_out <= unsigned(s_iir_v(C_IIR_STATE_WIDTH - 2 downto C_IIR_FRAC_BITS));
 
     -- ========================================================================
-    -- S10: Smear register — IIR output + edge ringing add (Y only).
+    -- s_y_rot companion pipe to S10 — needed by the smear register's
+    -- AC/DC mode mirror compute.  s_y_rot is at S9 timing; s_y_rot_d9 is
+    -- 1 cycle later (S10), s_y_rot_d10 is 2 cycles later (matches smear
+    -- register timing for the IIR input that drove the current state).
+    -- ========================================================================
+    p_y_rot_pipe : process(clk)
+    begin
+        if rising_edge(clk) then
+            s_y_rot_d9  <= s_y_rot;
+            s_y_rot_d10 <= s_y_rot_d9;
+        end if;
+    end process;
+
+    -- ========================================================================
+    -- S10: Smear register — IIR output (with optional AC/DC mirror) +
+    -- edge ringing add (Y only).
+    --
+    -- AC/DC coupling (Toggle 7):
+    --   DC (0): smear_y = state (capacitor smear lags input — bright
+    --           pixels leave bright trails into dark areas).
+    --   AC (1): smear_y = 2*input − state (capacitor anti-smear —
+    --           dark pixels cast NEGATIVE shadow-smears into bright
+    --           areas, and vice versa).  Stable: input drives state
+    --           normally; AC just MIRRORS the smear contribution.
+    --
     -- Toggle 8 (Edge Phase Invert) flips the ringing sign:
     --   off (0): bright outlines (edge adds to Y).
     --   on  (1): dark outlines  (edge subtracts from Y).
     -- ========================================================================
     p_smear_reg : process(clk)
         variable v_y_iir   : signed(11 downto 0);
+        variable v_y_in    : signed(11 downto 0);
+        variable v_y_smear : signed(11 downto 0);
         variable v_edge    : signed(11 downto 0);
         variable v_edge_sh : signed(11 downto 0);
         variable v_y_sum   : signed(11 downto 0);
     begin
         if rising_edge(clk) then
+            -- Apply AC/DC at the smear contribution.  v_y_smear is the
+            -- value that gets the edge-ringing add and the final clamp.
+            v_y_iir := signed(resize(s_iir_y_out, 12));
+            v_y_in  := signed(resize(s_y_rot_d10, 12));
+            if s_ac_dc = '1' then
+                -- AC: mirror state around input.  output = 2*input − state.
+                v_y_smear := shift_left(v_y_in, 1) - v_y_iir;
+            else
+                v_y_smear := v_y_iir;
+            end if;
+
             -- Edge ringing: shift the aligned edge magnitude, optionally
-            -- negate (Toggle 8), add to Y output.  Use the deepest edge
-            -- pipe stage to roughly align with IIR output.
+            -- negate (Toggle 8), add to Y output.
             v_edge    := signed(resize(s_edge_pipe(C_EDGE_PIPE_LEN - 1), 12));
             v_edge_sh := shift_right(v_edge, s_ring_shift_eff);
             if s_edge_phase_inv = '1' then
                 v_edge_sh := -v_edge_sh;
             end if;
 
-            -- Add to Y, clamp to 10-bit unsigned.
-            v_y_iir := signed(resize(s_iir_y_out, 12));
-            v_y_sum := v_y_iir + v_edge_sh;
+            -- Add to smear Y, clamp to 10-bit unsigned.
+            v_y_sum := v_y_smear + v_edge_sh;
             if v_y_sum < 0 then
                 s_smear_y <= (others => '0');
             elsif v_y_sum > 1023 then
@@ -1656,6 +1788,7 @@ begin
             end if;
 
             -- UV passes through the IIR output unchanged at this stage.
+            -- (AC/DC affects Y only per the design — UV always DC-coupled.)
             s_smear_u <= s_iir_u_out;
             s_smear_v <= s_iir_v_out;
         end if;
@@ -1693,35 +1826,30 @@ begin
     end process;
 
     p_tape_noise : process(clk)
-        variable v_noise   : signed(9 downto 0);
-        variable v_y_sum   : signed(11 downto 0);
-        variable v_u_sum   : signed(11 downto 0);
-        variable v_v_sum   : signed(11 downto 0);
+        variable v_noise : signed(9 downto 0);
+        variable v_y_sum : signed(11 downto 0);
     begin
         if rising_edge(clk) then
-            -- Signed noise centred around 0 from LFSR upper bits.
-            -- 8-bit signed range [-128, 127], scaled down by amp_shift.
+            -- Tape noise is Y-domain ONLY (luma graininess).  Adding the
+            -- same signed noise to U and V would displace UV along the
+            -- magenta/green axis (pitfall #14 — equal-signed UV offset is
+            -- NOT chroma modulation, it's a single-axis colour wiggle).
+            -- For a future "chroma noise" we'd use independent LFSR taps
+            -- or opposite-signed UV; deferred to V2.
             v_noise := signed(resize(unsigned(s_lfsr_q(15 downto 8)), 10))
                        - to_signed(128, 10);
             v_noise := shift_right(v_noise, s_noise_amp_shift);
 
             v_y_sum := signed(resize(s_smear_y, 12)) + resize(v_noise, 12);
-            v_u_sum := signed(resize(s_smear_u, 12)) + resize(v_noise, 12);
-            v_v_sum := signed(resize(s_smear_v, 12)) + resize(v_noise, 12);
 
-            -- Clamp to [0, 1023].
             if    v_y_sum < 0    then s_noisy_y <= (others => '0');
             elsif v_y_sum > 1023 then s_noisy_y <= to_unsigned(1023, 10);
             else                       s_noisy_y <= unsigned(v_y_sum(9 downto 0));
             end if;
-            if    v_u_sum < 0    then s_noisy_u <= (others => '0');
-            elsif v_u_sum > 1023 then s_noisy_u <= to_unsigned(1023, 10);
-            else                       s_noisy_u <= unsigned(v_u_sum(9 downto 0));
-            end if;
-            if    v_v_sum < 0    then s_noisy_v <= (others => '0');
-            elsif v_v_sum > 1023 then s_noisy_v <= to_unsigned(1023, 10);
-            else                       s_noisy_v <= unsigned(v_v_sum(9 downto 0));
-            end if;
+
+            -- UV pass through unchanged (no tape noise inject).
+            s_noisy_u <= s_smear_u;
+            s_noisy_v <= s_smear_v;
         end if;
     end process;
 
@@ -1883,22 +2011,27 @@ begin
         type t_sync_delay is array(0 to C_PROCESSING_DELAY_CLKS - 1) of std_logic;
         type t_data_delay is array(0 to C_PROCESSING_DELAY_CLKS - 1)
             of std_logic_vector(9 downto 0);
-        variable v_avid    : t_sync_delay := (others => '0');
-        variable v_hsync   : t_sync_delay := (others => '1');
-        variable v_vsync   : t_sync_delay := (others => '1');
-        variable v_field   : t_sync_delay := (others => '1');
-        variable v_y_clean : t_data_delay := (others => (others => '0'));
-        variable v_u_clean : t_data_delay := (others => (others => '0'));
-        variable v_v_clean : t_data_delay := (others => (others => '0'));
+        variable v_avid        : t_sync_delay := (others => '0');
+        variable v_hsync       : t_sync_delay := (others => '1');
+        variable v_vsync       : t_sync_delay := (others => '1');
+        variable v_field       : t_sync_delay := (others => '1');
+        -- hsync_start pulse pipe — needed at depth 10 for IIR reset
+        -- (1-cycle pulse, must be piped through registers, can't be
+        -- derived combinationally from v_hsync without extra edge logic).
+        variable v_hsync_start : t_sync_delay := (others => '0');
+        variable v_y_clean     : t_data_delay := (others => (others => '0'));
+        variable v_u_clean     : t_data_delay := (others => (others => '0'));
+        variable v_v_clean     : t_data_delay := (others => (others => '0'));
     begin
         if rising_edge(clk) then
-            v_avid    := data_in.avid    & v_avid(0    to C_PROCESSING_DELAY_CLKS - 2);
-            v_hsync   := data_in.hsync_n & v_hsync(0   to C_PROCESSING_DELAY_CLKS - 2);
-            v_vsync   := data_in.vsync_n & v_vsync(0   to C_PROCESSING_DELAY_CLKS - 2);
-            v_field   := data_in.field_n & v_field(0   to C_PROCESSING_DELAY_CLKS - 2);
-            v_y_clean := data_in.y       & v_y_clean(0 to C_PROCESSING_DELAY_CLKS - 2);
-            v_u_clean := data_in.u       & v_u_clean(0 to C_PROCESSING_DELAY_CLKS - 2);
-            v_v_clean := data_in.v       & v_v_clean(0 to C_PROCESSING_DELAY_CLKS - 2);
+            v_avid        := data_in.avid          & v_avid(0        to C_PROCESSING_DELAY_CLKS - 2);
+            v_hsync       := data_in.hsync_n       & v_hsync(0       to C_PROCESSING_DELAY_CLKS - 2);
+            v_vsync       := data_in.vsync_n       & v_vsync(0       to C_PROCESSING_DELAY_CLKS - 2);
+            v_field       := data_in.field_n       & v_field(0       to C_PROCESSING_DELAY_CLKS - 2);
+            v_hsync_start := s_timing.hsync_start  & v_hsync_start(0 to C_PROCESSING_DELAY_CLKS - 2);
+            v_y_clean     := data_in.y             & v_y_clean(0     to C_PROCESSING_DELAY_CLKS - 2);
+            v_u_clean     := data_in.u             & v_u_clean(0     to C_PROCESSING_DELAY_CLKS - 2);
+            v_v_clean     := data_in.v             & v_v_clean(0     to C_PROCESSING_DELAY_CLKS - 2);
 
             -- Sync outputs at full pipeline depth (18 cycles).
             data_out.avid    <= v_avid(C_PROCESSING_DELAY_CLKS - 1);
@@ -1906,9 +2039,13 @@ begin
             data_out.vsync_n <= v_vsync(C_PROCESSING_DELAY_CLKS - 1);
             data_out.field_n <= v_field(C_PROCESSING_DELAY_CLKS - 1);
 
+            -- IIR-gate taps at depth 10 (= s_y_rot data timing).  Tap
+            -- index = depth - 1 (variable indices 0-based, v_array(K) at
+            -- clock T+1 = data_in at T-K = K+1 cycles delayed).
+            s_avid_d10        <= v_avid(C_IIR_GATE_DEPTH - 1);
+            s_hsync_start_d10 <= v_hsync_start(C_IIR_GATE_DEPTH - 1);
+
             -- Dry-path data taps at depth 14 (= interpolator's "a" input).
-            -- C_DRY_TAP_DEPTH = 14 → tap index 13 (variable indices 0-based,
-            -- v_array(K) at clock T+1 = data_in at T-K = K+1 cycles delayed).
             s_data_in_d14_y <= v_y_clean(C_DRY_TAP_DEPTH - 1);
             s_data_in_d14_u <= v_u_clean(C_DRY_TAP_DEPTH - 1);
             s_data_in_d14_v <= v_v_clean(C_DRY_TAP_DEPTH - 1);

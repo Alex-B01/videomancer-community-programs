@@ -54,11 +54,28 @@ ROT_MAX_SHIFTS = 3        # up to 3 power-of-2 shifts summed per coefficient
 # Output also unsigned 10-bit, clamped to [0, 1023].
 # -----------------------------------------------------------------------------
 
+def _index_to_norm(x: int) -> float:
+    """Convert LUT index (0..ENTRIES-1) to centred-normalised input
+    in the range [-1, +1].
+
+    BUG FIX (2026-04-26): The original formula used `(x / DATA_MAX) * 2 - 1`
+    which treats x=0..255 as a fraction of 1023 → only samples the bottom
+    25% of the curve.  For x=128 (= midpoint Y=512 via 8-bit slice),
+    the original gave norm=-0.75 instead of 0 → midpoint LUT value was
+    72 instead of 512.  Bird image was destroyed because LUT compressed
+    Y range to [0, 181] regardless of curve shape.
+
+    The LUT address is the top 8 bits of a 10-bit Y value, so x=0..255
+    represents Y=0..1020 (step 4).  Centre-normalising over the LUT's
+    own range (ENTRIES-1) gives the correct curve sampling."""
+    return (x / (ENTRIES - 1)) * 2.0 - 1.0
+
+
 def diode_y_bank_0_soft_overdrive(x: int) -> int:
     """Bank 0 — soft analog overdrive. tanh-shaped gentle compression
     around midpoint. Drive scaled so unity input maps to ~0.85× output —
     the classic 'warm saturation' curve."""
-    norm = (x / DATA_MAX) * 2.0 - 1.0           # [-1, 1]
+    norm = _index_to_norm(x)                    # [-1, 1]
     drive = 1.2
     out = math.tanh(norm * drive) / math.tanh(drive)  # [-1, 1] normalised
     return _to_u10((out + 1.0) * 0.5 * DATA_MAX)
@@ -68,7 +85,7 @@ def diode_y_bank_1_hard_clip(x: int) -> int:
     """Bank 1 — hard clipping fuzz. Rail-clipped at ±0.6× full scale
     around midpoint (= [205, 819] in 10-bit). Aggressive square-wave-ish
     response on bright/dark extremes."""
-    norm = (x / DATA_MAX) * 2.0 - 1.0
+    norm = _index_to_norm(x)
     threshold = 0.6
     if norm > threshold:
         out = threshold
@@ -84,7 +101,7 @@ def diode_y_bank_2_one_fold(x: int) -> int:
     """Bank 2 — mild wavefolder. One Sabattier-style fold above
     0.8× threshold (and symmetrically below). Highlights start to invert
     into mid-tones, creating a single bright→dark wrap."""
-    norm = (x / DATA_MAX) * 2.0 - 1.0
+    norm = _index_to_norm(x)
     threshold = 0.8
     if abs(norm) > threshold:
         # Reflect the over-threshold portion back
@@ -99,7 +116,7 @@ def diode_y_bank_3_violent_fold(x: int) -> int:
     """Bank 3 — violent wavefolder. Three folds across the range; harsh
     harmonic content. Highlights wrap multiple times, producing
     interference-like banding on smooth gradients."""
-    norm = (x / DATA_MAX) * 2.0 - 1.0
+    norm = _index_to_norm(x)
     folds = 3
     out = math.sin(norm * folds * math.pi / 2.0)
     return _to_u10((out + 1.0) * 0.5 * DATA_MAX)
@@ -230,9 +247,21 @@ def emit_rotation_table_constant(entries) -> str:
         comma = "," if b < ROT_BINS - 1 else ""
         cs = e["cos_shifts"]
         ss = e["sin_shifts"]
-        # Pack signs as a 3-bit std_logic_vector (1 = subtract, 0 = add)
-        cos_sign_bits = "".join("1" if s < 0 else "0" for s in e["cos_signs"])
-        sin_sign_bits = "".join("1" if s < 0 else "0" for s in e["sin_signs"])
+        # Pack signs as a 3-bit std_logic_vector (1 = subtract, 0 = add).
+        # IMPORTANT: VHDL std_logic_vector literal "abc" with width 3 has
+        # bit 2 = leftmost char and bit 0 = rightmost char.  The shift_add_3
+        # procedure indexes signs(0) for term 0 (= cos_a), signs(1) for
+        # term 1 (= cos_b), signs(2) for term 2 (= cos_c).  So the VHDL
+        # bit positions need:
+        #   signs(0) = signs[0]_python  → rightmost char
+        #   signs(1) = signs[1]_python  → middle char
+        #   signs(2) = signs[2]_python  → leftmost char
+        # i.e. the Python list emitted in REVERSE.
+        # (Earlier non-reversed emit sign-flipped terms 0 and 2 for any
+        # bin with asymmetric signs — produced a roughly -R⁻¹(u,v)
+        # rotation that clamped UV to 0 = green collapse.)
+        cos_sign_bits = "".join("1" if s < 0 else "0" for s in reversed(e["cos_signs"]))
+        sin_sign_bits = "".join("1" if s < 0 else "0" for s in reversed(e["sin_signs"]))
         lines.append(
             f"    {b:2d} => (cos_a => {cs[0]:2d}, cos_b => {cs[1]:2d}, cos_c => {cs[2]:2d}, "
             f"sin_a => {ss[0]:2d}, sin_b => {ss[1]:2d}, sin_c => {ss[2]:2d}, "
