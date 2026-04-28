@@ -1,0 +1,138 @@
+# Copyright (C) 2026 AB (Sourdough_Stu)
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Sync Bleed Program Configuration
+
+[program]
+program_id = "com.sourdoughstu.sync_bleed"
+program_name = "Sync Bleed"
+program_version = "1.0.0"
+abi_version = ">=1.0,<2.0"
+author = "AB (Sourdough_Stu)"
+license = "GPL-3.0"
+categories = ["Glitch", "Color", "Feedback", "Synthesis"]
+program_type = "processing"
+description = "Analog dirty mixer / broken TBC: envelope-driven smear, wavefolder, NTSC comb, hue rotation, line jitter, tape noise."
+hardware_compatibility = ["rev_a", "rev_b"]
+core = "yuv444_30b"
+url = "https://github.com/lzxindustries/videomancer-community-programs"
+
+# ---------------------------------------------------------------------------
+# Engine 1: Horizontal Physics (Smearing & Ringing)
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_1"
+control_mode = "linear"
+name_label = "Cap Bleed"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_2"
+control_mode = "linear"
+name_label = "Edge Reson"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+# ---------------------------------------------------------------------------
+# Engine 2: Subcarrier & NTSC Artifacting
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_3"
+control_mode = "linear"
+name_label = "Hue Twist"
+min_value = 0
+max_value = 1023
+initial_value = 512
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_4"
+control_mode = "linear"
+name_label = "NTSC Comb"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+# ---------------------------------------------------------------------------
+# Engine 3: Geometry & Tape Degradation
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_5"
+control_mode = "linear"
+name_label = "TBC Jitter"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_6"
+control_mode = "linear"
+name_label = "Env React"
+min_value = 0
+max_value = 1023
+initial_value = 512
+
+# ---------------------------------------------------------------------------
+# Toggles
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "toggle_switch_7"
+name_label = "AC/DC"
+value_labels = ["DC (bright→dark)", "AC (dark→bright)"]
+
+[[parameter]]
+parameter_id = "toggle_switch_8"
+name_label = "Edge Phase"
+value_labels = ["Bright Outline", "Dark Outline"]
+
+[[parameter]]
+parameter_id = "toggle_switch_9"
+name_label = "UV Swap"
+value_labels = ["Off", "On"]
+
+[[parameter]]
+parameter_id = "toggle_switch_10"
+name_label = "Diode Base"
+value_labels = ["Soft", "Hard"]
+
+[[parameter]]
+parameter_id = "toggle_switch_11"
+name_label = "Bleed Freeze"
+value_labels = ["Off", "On"]
+
+# ---------------------------------------------------------------------------
+# Master Mix
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "linear_potentiometer_12"
+control_mode = "linear"
+name_label = "Master Mix"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+# ---------------------------------------------------------------------------
+# Factory presets
+# ---------------------------------------------------------------------------
+
+[[preset]]
+name = "Clean"
+rotary_potentiometer_1 = 0
+rotary_potentiometer_2 = 0
+rotary_potentiometer_3 = 512
+rotary_potentiometer_4 = 0
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 512
+toggle_switch_7 = 0
+toggle_switch_8 = 0
+toggle_switch_9 = 0
+toggle_switch_10 = 0
+toggle_switch_11 = 0
+linear_potentiometer_12 = 0
