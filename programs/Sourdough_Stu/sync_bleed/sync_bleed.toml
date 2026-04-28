@@ -1,22 +1,21 @@
+# Copyright (C) 2026 AB (Sourdough_Stu)
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Sync Bleed Program Configuration
+
 [program]
 program_id = "com.sourdoughstu.sync_bleed"
 program_name = "Sync Bleed"
 program_version = "1.0.0"
 abi_version = ">=1.0,<2.0"
-hardware_compatibility = ["rev_a", "rev_b"]
-core = "yuv444_30b"
-author = "Alex Ball"
+author = "AB (Sourdough_Stu)"
 license = "GPL-3.0"
 categories = ["Glitch", "Color", "Feedback", "Synthesis"]
 program_type = "processing"
-description = "Analog dirty mixer / broken TBC. Dual envelope drives TBC tearing, diode wavefolding, capacitor smear, sync-crush."
-
-# 1080p only — line buffers sized for 1920-pixel active line, motion proxy
-# uses fixed 1920-sample offset, envelope dividers set for HD active-pixel
-# count.  SD support would require resolution-dependent C_AVG_SHIFT and is
-# deferred to V2.
-# (Note: SDK build still produces all 6 bitstream variants; SD modes will
-# fit but envelope/comb proportions are calibrated for HD.)
+description = "Analog dirty mixer / broken TBC: envelope-driven smear, wavefolder, NTSC comb, hue rotation, line jitter, tape noise."
+hardware_compatibility = ["rev_a", "rev_b"]
+core = "yuv444_30b"
+url = "https://github.com/lzxindustries/videomancer-community-programs"
 
 # ---------------------------------------------------------------------------
 # Engine 1: Horizontal Physics (Smearing & Ringing)
@@ -79,7 +78,7 @@ max_value = 1023
 initial_value = 512
 
 # ---------------------------------------------------------------------------
-# Toggles (packed into registers_in(6) bits[4:0])
+# Toggles
 # ---------------------------------------------------------------------------
 
 [[parameter]]
@@ -104,7 +103,7 @@ value_labels = ["Soft", "Hard"]
 
 [[parameter]]
 parameter_id = "toggle_switch_11"
-name_label = "Sync Crush"
+name_label = "Bleed Freeze"
 value_labels = ["Off", "On"]
 
 # ---------------------------------------------------------------------------
@@ -120,10 +119,7 @@ max_value = 1023
 initial_value = 0
 
 # ---------------------------------------------------------------------------
-# Factory presets — placeholders, will tune at M11 perceptual sweep stage.
-# Default load state = Clean (Master fully dry, knobs at minimal-effect).
-# User raises Master to reveal baseline behaviour, then explores one knob
-# at a time per the spatial_mosher Session-5 convention.
+# Factory presets
 # ---------------------------------------------------------------------------
 
 [[preset]]

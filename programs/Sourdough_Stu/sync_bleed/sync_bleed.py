@@ -7,7 +7,7 @@ Writes ``sync_bleed_lut_pkg.vhd`` with constant arrays consumed by
 
   * 4 Y-channel diode wavefolder banks (256 × 10b each)
   * 4 UV-channel diode wavefolder banks (256 × 10b each, midpoint-anchored
-    around C_CHROMA_MID = 512 per pitfall #15)
+    around C_CHROMA_MID = 512 so UV stays neutral when the curve is "off")
   * 16-bin sin/cos rotation table (multiplierless shift-add coefficients,
     target ~3% RMS accuracy over the full circle)
 
@@ -58,16 +58,9 @@ def _index_to_norm(x: int) -> float:
     """Convert LUT index (0..ENTRIES-1) to centred-normalised input
     in the range [-1, +1].
 
-    BUG FIX (2026-04-26): The original formula used `(x / DATA_MAX) * 2 - 1`
-    which treats x=0..255 as a fraction of 1023 → only samples the bottom
-    25% of the curve.  For x=128 (= midpoint Y=512 via 8-bit slice),
-    the original gave norm=-0.75 instead of 0 → midpoint LUT value was
-    72 instead of 512.  Bird image was destroyed because LUT compressed
-    Y range to [0, 181] regardless of curve shape.
-
     The LUT address is the top 8 bits of a 10-bit Y value, so x=0..255
     represents Y=0..1020 (step 4).  Centre-normalising over the LUT's
-    own range (ENTRIES-1) gives the correct curve sampling."""
+    own range (ENTRIES-1) keeps midpoint at norm=0."""
     return (x / (ENTRIES - 1)) * 2.0 - 1.0
 
 
@@ -113,32 +106,27 @@ def diode_y_bank_2_one_fold(x: int) -> int:
 
 
 def diode_y_bank_3_violent_fold(x: int) -> int:
-    """Bank 3 — violent wavefolder. Three folds across the range; harsh
-    harmonic content. Highlights wrap multiple times, producing
-    interference-like banding on smooth gradients."""
+    """Bank 3 — moderate wavefolder. Two folds across the range:
+    black input → white output, white → black via the central wrap.
+    Inversion character without multi-fold interference banding."""
     norm = _index_to_norm(x)
-    folds = 3
+    folds = 2
     out = math.sin(norm * folds * math.pi / 2.0)
     return _to_u10((out + 1.0) * 0.5 * DATA_MAX)
 
 
 # -----------------------------------------------------------------------------
-# UV-channel diode curves — midpoint-anchored per pitfall #15.
-# Operate on signed deviation from CHROMA_MID, output anchored back to mid.
+# UV-channel diode curves — operate on UV centred around CHROMA_MID = 512.
+# Curves are built around midpoint=512 already, so passing UV input
+# straight through preserves midpoint alignment (UV stays neutral when
+# the curve is "off").
 # -----------------------------------------------------------------------------
 
 def _uv_curve(curve_fn, x: int) -> int:
-    """Wrap a Y-domain curve so it operates on UV deviation from
-    CHROMA_MID. The Y curve sees an input centred around 512 (which
-    after our offset becomes the curve's midpoint at 512)."""
-    # Subtract midpoint, run through the curve, add back. Curves
-    # already output around 512 as midpoint, so the wrap preserves
-    # midpoint alignment.
-    centered_in = x - CHROMA_MID + CHROMA_MID    # tautology — passes x straight
-    # We pass x unchanged because the Y curves are themselves built around
-    # midpoint=512. The midpoint anchoring concern is that UV must STAY
-    # around 512, which the curves preserve.
-    return curve_fn(centered_in)
+    """Apply a Y-domain curve to UV input.  UV is centred around
+    CHROMA_MID; the Y curves are built around the same midpoint, so
+    no offset transform is needed."""
+    return curve_fn(x)
 
 
 def diode_uv_bank_0(x): return _uv_curve(diode_y_bank_0_soft_overdrive, x)
@@ -248,18 +236,11 @@ def emit_rotation_table_constant(entries) -> str:
         cs = e["cos_shifts"]
         ss = e["sin_shifts"]
         # Pack signs as a 3-bit std_logic_vector (1 = subtract, 0 = add).
-        # IMPORTANT: VHDL std_logic_vector literal "abc" with width 3 has
-        # bit 2 = leftmost char and bit 0 = rightmost char.  The shift_add_3
-        # procedure indexes signs(0) for term 0 (= cos_a), signs(1) for
-        # term 1 (= cos_b), signs(2) for term 2 (= cos_c).  So the VHDL
-        # bit positions need:
-        #   signs(0) = signs[0]_python  → rightmost char
-        #   signs(1) = signs[1]_python  → middle char
-        #   signs(2) = signs[2]_python  → leftmost char
-        # i.e. the Python list emitted in REVERSE.
-        # (Earlier non-reversed emit sign-flipped terms 0 and 2 for any
-        # bin with asymmetric signs — produced a roughly -R⁻¹(u,v)
-        # rotation that clamped UV to 0 = green collapse.)
+        # VHDL literal "abc" of width 3 has bit 2 = leftmost char, bit 0
+        # = rightmost char.  shift_add_3 indexes signs(0) for term 0
+        # (cos_a), signs(1) for term 1 (cos_b), signs(2) for term 2
+        # (cos_c) — so the Python list is emitted REVERSED so signs(0)
+        # lands at the rightmost position.
         cos_sign_bits = "".join("1" if s < 0 else "0" for s in reversed(e["cos_signs"]))
         sin_sign_bits = "".join("1" if s < 0 else "0" for s in reversed(e["sin_signs"]))
         lines.append(
