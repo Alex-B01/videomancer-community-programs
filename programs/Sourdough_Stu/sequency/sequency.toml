@@ -1,16 +1,17 @@
 # Copyright (C) 2026 AB (Sourdough_Stu)
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# SEQUENCY - Walsh-Hadamard organ (FULL-CHROMA, R2SDF).  Program 5.
+# SEQUENCY - Walsh-Hadamard organ (Y-ONLY, R2SDF).  Program 5.
 # NOTE: the all-timings key is intentionally OMITTED -- its absence IS the
 # all-formats declaration (block tiling self-calibrates from avid edges; no
 # framebuffer, no temporal state).  Musical knob scaling lives here
 # (control_mode / value_labels), not in fabric.
-# Full-chroma build: a wht_organ_lane runs on each of Y/U/V (chroma always on).
-# Knob 5 (Crosstalk) and Toggle 11 (Chroma) are RESERVED/INERT (read, not acted
-# on) after the Gate-1 timing rework dropped the cross-lane CROSSTALK datapath;
-# both stay declared for forward-compat.  Toggles 7/8 likewise carry inert
-# retired-mode positions (v1 fabric is always Hard / XOR).
+# Y-only build: one wht_organ_lane runs on Y; U/V are PASSTHROUGH (delay-matched
+# to the Y organ+fader latency).  The full-chroma 3-lane build was congestion-
+# bound on HD timing; reverted to the proven Y-only scope.  Knob 5 (Crosstalk)
+# and Toggle 11 (Chroma) are RESERVED/INERT (read, not acted on -- chroma is
+# passthrough, no cross-lane datapath); both stay declared for forward-compat.
+# Toggles 7/8 likewise carry inert retired-mode positions (v1 = always Hard / XOR).
 
 [program]
 program_id = "com.sourdoughstu.sequency"
@@ -21,7 +22,7 @@ author = "AB (Sourdough_Stu)"
 license = "GPL-3.0"
 categories = ["Signal", "Pattern", "Glitch"]
 program_type = "processing"
-description = "Full-chroma Walsh-Hadamard organ: Y/U/V spectral blocks played with quantize, tilt, scramble, regen, and adapt."
+description = "Walsh-Hadamard luma organ: Y spectral blocks played with quantize, tilt, scramble, regen, and adapt (U/V passthrough)."
 hardware_compatibility = ["rev_a", "rev_b"]
 core = "yuv444_30b"
 url = "https://github.com/lzxindustries/videomancer-community-programs"

@@ -6,34 +6,42 @@
 -- https://github.com/lzxindustries/videomancer-community-programs
 --
 -- Program Name:
---   Sequency  (FULL-CHROMA, R2SDF streaming WHT — REV-D committed build)
+--   Sequency  (Y-ONLY, R2SDF streaming WHT — committed build)
 --
 -- Author:
 --   AB (Sourdough_Stu)
 --
 -- Overview:
---   16-point HORIZONTAL Walsh-Hadamard blocks, computed by R2SDF (Radix-2
---   Single-path Delay Feedback): a streaming transform, 1 px/clk, ZERO
---   multipliers. Data flows through 4 forward stages (delay depths D=8,4,2,1),
---   a serial quantizer / coefficient-play region, and 4 inverse stages
---   (D=1,2,4,8). H*Ht = 16*I -> >>4 normalize. Coefficients are "played" one
---   per clock between forward and inverse: QUANTIZE (sequency-weighted hard
+--   16-point HORIZONTAL Walsh-Hadamard blocks on the Y (luma) channel, computed
+--   by R2SDF (Radix-2 Single-path Delay Feedback): a streaming transform, 1
+--   px/clk, ZERO multipliers. Data flows through 4 forward stages (delay depths
+--   D=8,4,2,1), a serial quantizer / coefficient-play region, and 4 inverse
+--   stages (D=1,2,4,8). H*Ht = 16*I -> >>4 normalize. Coefficients are "played"
+--   one per clock between forward and inverse: QUANTIZE (sequency-weighted hard
 --   deadzone, barrel-shift + per-sequency LUT), TILT (runtime per-sequency
 --   attenuation, knob 2), SCRAMBLE (coefficient-index XOR), REGEN (vertical
 --   coefficient feedback via a line buffer, saturating, freeze-during-blank),
---   ADAPT (Y block-energy -> deadzone threshold, shared/Y-driven). Blended
---   dry/wet via interpolator_u on all three channels. (CROSSTALK removed in the
---   Gate-1 timing rework — see the LC note below.)
+--   ADAPT (Y block-energy -> deadzone threshold). Blended dry/wet via one
+--   interpolator_u on Y.
 --   No framebuffer, no temporal state -> natively all-formats. Block index =
 --   avid-anchored mod-16 counter (720/1280/1920 all divide by 16 exactly).
 --
---   Committed topology: a complete wht_organ_lane instantiated x3 (Y/U/V),
---   fully INDEPENDENT (no cross-lane datapath coupling). Shared control-derive
+--   Y-ONLY committed topology: a single wht_organ_lane on Y with the FULL
+--   feature set (QUANTIZE/TILT/SCRAMBLE/REGEN/ADAPT + dry/wet fader). U and V
+--   are PASSTHROUGH, delay-matched to the Y organ+fader latency (48) via the
+--   shared BRAM circular delay + the +4 interpolator-alignment tail (the
+--   sequency_sdf reference-prototype pattern). The U/V organ lanes and the
+--   packed U/V REGEN coefficient buffer are REMOVED. Shared control-derive
 --   (TILT strength/dir, SCRAMBLE key, ADAPT threshold, and the precomputed
---   QUANTIZE deadzone thresholds q_th0..3) lives in the top; ADAPT
---   is the only cross-lane influence (Y-energy -> all lanes' deadzone, a shared
---   control, not a datapath tap). Knob 5 (CROSSTALK) and Toggle 11 (Chroma) are
---   RESERVED/INERT (read, not acted on) after the Gate-1 rework dropped CROSSTALK.
+--   QUANTIZE deadzone thresholds q_th0..3) lives in the top and drives the one
+--   Y lane. Knob 5 (CROSSTALK) and Toggle 11 (Chroma) are RESERVED/INERT (read,
+--   not acted on): chroma is passthrough, there is no cross-lane datapath. All
+--   12 controls stay declared.
+--
+--   Scope note: the full-4:4:4-chroma build (3x wht_organ_lane) was congestion-
+--   bound (~88% fill, Fmax stuck at 56.5->62.9->66.1 MHz across 3 timing
+--   iterations); reverted to Y-only — the comfortable, proven scope — by user
+--   decision (cut losses on full-chroma HD timing).
 --
 -- Pipeline stages + total latency:
 --   Organ core (C_PROCESSING_DELAY_CLKS = 44, /4):
@@ -51,46 +59,54 @@
 --     I3 inverse SDF D=4  (W=19) ......................... 5  (cum 33)
 --     I4 inverse SDF D=8  (W=20) -> reconstructed x16 .... 9  (cum 42)
 --     S  +8 round, >>4 normalize, R1 broadcast clamp ..... 2  (cum 44)
---   Dry/wet fader (interpolator_u) ....................... 4  -> total 48
+--   Dry/wet fader (interpolator_u, Y only) ............... 4  -> total 48
 --   => C_PROCESSING_DELAY_CLKS = 44 (organ), C_SYNC_DELAY_CLKS = 48 (= 44+4,
---      the interpolator tail; howler discipline). Sync + dry ride the BRAM
---      circular delay (44) and a +4 sync tail so data_out is aligned at 48,
+--      the interpolator tail; howler discipline). Sync + dry-Y + U/V passthrough
+--      ride the BRAM circular delay (44); dry-Y feeds the Y fader (-> 48) and
+--      U/V + sync ride a shared +4 tail so every data_out port is aligned at 48,
 --      FIXED and independent of every knob/toggle/fader (R5/R8).
 --      NOTE: spec headline "latency 44" = the organ core; the mandatory 4-clock
 --      interpolator_u fader makes the sync-aligned end-to-end 48 (both /4). This
 --      is the spec's own 44-vs-48 re-point (spec S1); flagged to orchestrator.
 --
--- EBR map (physical, power-of-two) — 17 EBR total:
+-- EBR map (physical, power-of-two) — 9 EBR total:
 --   REGEN Y coeff line buffer   2048 x 12  (2048x2 mode)  1W/1R  = 6 EBR
---   REGEN U+V packed line buf   2048 x 16  (2048x2 mode)  1W/1R  = 8 EBR
---     (U in bits 15..8, V in 7..0; 8-bit chroma coeff precision, 4:2:2-tolerant)
---   Sync + dry Y/U/V delay       64  x 34  (256x16 mode)  1W/1R  = 3 EBR
---     (dryY10 + dryU10 + dryV10 + avid/hs/vs/fld = 34 bits, width-limited)
+--   Sync + dry-Y + U/V delay     64  x 34  (256x16 mode)  1W/1R  = 3 EBR
+--     (dryY10 + passU10 + passV10 + avid/hs/vs/fld = 34 bits, width-limited)
 --   -------------------------------------------------------------------------
---   TOTAL = 6 + 8 + 3 = 17 EBR   (budget MAX_EBR 20, device 32)
+--   TOTAL = 6 + 3 = 9 EBR   (budget MAX_EBR 20, device 32)
+--   The packed U+V REGEN buffer (8 EBR) is REMOVED with the U/V lanes. The
+--   delay stays 3 EBR (not the reference prototype's 2) because it also carries
+--   the Y fader's dry tap (dryY 10b) alongside U/V+sync (34b > 32b -> 3 EBR);
+--   sequency_sdf had no fader so its delay was 24b/2 EBR. 9 << 20 budget.
 --
--- LC estimate (honest, paper): measured 3-lane R2SDF skeleton 4,415 LC + levered
---   feature deltas ~2,000 (REGEN/TILT/SCRAMBLE/ADAPT/fader + width re-derivation)
---   => ~6,450 LC paper. CROSSTALK REMOVED in the Gate-1 timing rework (~150 LC +
---   glue freed); it was the cross-lane V-tap -> mix -> Y-lane Q2 3-input add that
---   crashed Fmax to 56.5 MHz. Multipliers in the organ: 0 (all shift/add). The
---   only * in the design is inside the SDK interpolator_u x3 (sanctioned fader).
---   Gate-1 smoke history (hd_hdmi, seed 1): CROSSTALK removal 56.5 -> 62.92;
---   Q3 THRESHOLD HOIST (this commit) 62.92 -> 66.14 MHz. LC=6779/7680 (PASS) ·
---   EBR=17/20 (PASS) · Fmax=66.14 -> STILL FAIL (<76). The hoist moved the
---   block-stable deadzone threshold ((qeff<<k)+ADAPT, clamped >=0) out of the
---   per-coefficient path into a shared top precompute (s_q_th -> q_th0..3), so
---   Q3 is now band-select + compare and is NO LONGER critical (bit-exact: thr=0
---   at QUANTIZE=0; ADAPT block-phase shifts 1 clk, within tol). Latency 48 (/4)
---   unchanged. NEW critical path MOVED to the REGEN Q2 store: ram_uv (packed U+V
---   line buffer) BRAM read -> long route -> v_sum 18b add + R3 sat -> s_cur_v
---   write = 15.02 ns (8.13 ns / 54% routing; BRAM-to-fabric hop + 88% fill).
---   Slack histogram: only a handful of failing endpoints (targeted, not a global
---   congestion wall). Deeper fix = pipeline the REGEN Q2 add (BRAM-read -> reg
---   -> add -> store), which forces a latency re-point 48 -> 52 (/4) touching the
---   REGEN feedback loop + shared s_c2 path + ADAPT tap + REGEN addr pipeline +
---   sync/dry depth; OR a fill-reduction lever (4:2:2 half-rate chroma) OR
---   SD-only. ESCALATED to the orchestrator (short-of-76 tradeoff decision).
+-- LC estimate (honest, paper): Y-only single wht_organ_lane (measured 1-lane
+--   R2SDF skeleton ~1,500 LC + levered feature deltas ~1,700 for
+--   REGEN/TILT/SCRAMBLE/ADAPT/qth-precompute + one interpolator_u fader + the
+--   delay/tail/REGEN-address glue) => ~3,700 LC paper. Multipliers in the organ:
+--   0 (all shift/add). The only * in the design is inside the single SDK
+--   interpolator_u (sanctioned Y fader). Zero runtime multiplies elsewhere.
+--   REDUCTION RATIONALE: the full-4:4:4 3-lane build was congestion-bound at
+--   ~88% fill — Fmax climbed 56.5 -> 62.9 -> 66.1 MHz across three timing
+--   iterations (CROSSTALK removal, then the Q3 threshold hoist) but never
+--   cleared the 76 MHz HD gate; the failing endpoints clustered on the packed
+--   U+V REGEN store (ram_uv BRAM read -> 18b add + R3 sat -> write). User cut
+--   losses on full-chroma HD timing and reverted to the proven Y-only scope.
+--   Dropping the U/V organ lanes + the ram_uv buffer drops fill 88% -> 48% and
+--   frees the congestion, BUT the REGEN feedback store is INTRINSIC, not
+--   congestion: MEASURED Gate-1 smoke (hd_hdmi, seed 1) = 3,698 LC (48%) /
+--   9 EBR / Fmax 70.97 MHz — LC & EBR comfortable, but Fmax STILL < the 76 gate
+--   (up from the 3-lane 66.1, not cleared). Critical path = the Y REGEN Q2
+--   store: ram_y BRAM read (2.15 ns clk-to-q) -> v_sum 18b add + R3 double-
+--   saturate (s_c2 16b & s_cur_y 12b) -> register; the BRAM read feeding the
+--   adder in a single clock is the wall (pre-route 74.75, also < 76 -> not seed
+--   noise). Deeper fix = pipeline the REGEN add (BRAM-read -> reg -> add ->
+--   store), which re-points latency 48 -> 52 (touches the REGEN loop + sync/dry
+--   depth); OR a latency-neutral REGEN feedback-term retime (register the
+--   shifted regen_prev off the adder's critical input, needs sim re-verify);
+--   OR reduced REGEN precision. Each is an architectural tradeoff and the task
+--   fixed latency at 48 -> NOT applied here; ESCALATED to the orchestrator. The
+--   shared-threshold hoist (s_q_th -> q_th0..3) is KEPT. Latency 48 (/4).
 --
 -- Register map (SPI: pots -> registers_in(0..5), toggles -> (6) bits 0..4,
 --               fader -> (7), timing ID -> (8)(3 downto 0) [unused: all-formats]):
@@ -104,16 +120,16 @@
 --   Tog 8   registers_in(6)(1)  ScrMode    XOR/Rotate    (Rotate inert v1)
 --   Tog 9   registers_in(6)(2)  ADAPT pol  Normal/Inverted
 --   Tog 10  registers_in(6)(3)  SpecHold   Live/Hold
---   Tog 11  registers_in(6)(4)  Chroma     RESERVED/INERT, fixed-on (read, ignored)
+--   Tog 11  registers_in(6)(4)  Chroma     RESERVED/INERT (U/V passthrough; read, ignored)
 --   Fader   registers_in(7)     Dry/Wet    interpolator_u crossfade
 --
 -- No resets (iCE40 has none): every register/BRAM relies on signal init.
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
--- wht_organ_lane : one complete R2SDF Walsh-Hadamard organ (Y, U, or V).
---   Forward SDF -> Q-region (per-lane feature apply) -> inverse SDF -> scale.
---   Lanes are INDEPENDENT (CROSSTALK removed in the Gate-1 rework). Shared seams:
+-- wht_organ_lane : one complete R2SDF Walsh-Hadamard organ. Generic/reusable;
+--   in the Y-only build it is instantiated ONCE (on Y) — U/V are passthrough.
+--   Forward SDF -> Q-region (feature apply) -> inverse SDF -> scale. Seams:
 --     coef_tap  : this lane's Q1 (tilted) coefficient — ADAPT tap (Y lane only;
 --                 U/V leave it open)
 --     regen_prev: previous-line stored coefficient (RAM owned by top, packable)
@@ -512,12 +528,11 @@ architecture sequency of program_top is
   type t_qth is array (0 to 3) of signed(17 downto 0);
   signal s_q_th : t_qth := (others => (others => '0'));
 
-  -- ------- REGEN line buffers (owned here so U/V can pack) --------------------
-  -- Y : 2048 x 12 = 6 EBR.  U+V packed : 2048 x 16 = 8 EBR.
-  type t_ram_y  is array (0 to 2047) of std_logic_vector(11 downto 0);
-  type t_ram_uv is array (0 to 2047) of std_logic_vector(15 downto 0);
-  signal ram_y  : t_ram_y  := (others => (others => '0'));
-  signal ram_uv : t_ram_uv := (others => (others => '0'));
+  -- ------- REGEN line buffer (Y coefficient feedback only) -------------------
+  -- Y : 2048 x 12 = 6 EBR.  (The packed U+V coeff buffer is removed with the
+  -- U/V organ lanes; chroma no longer resonates.)
+  type t_ram_y is array (0 to 2047) of std_logic_vector(11 downto 0);
+  signal ram_y : t_ram_y := (others => (others => '0'));
 
   signal s_qavid    : std_logic := '0';                 -- avid delayed to Q1
   signal s_qa_sr    : std_logic_vector(0 to C_AVID_Q_DELAY - 1) := (others => '0');
@@ -526,33 +541,30 @@ architecture sequency of program_top is
   signal s_wr_addr  : unsigned(10 downto 0) := (others => '0');
   signal s_wr_en1   : std_logic := '0';
   signal s_wr_en    : std_logic := '0';
-  signal s_prev_y   : signed(11 downto 0) := (others => '0');
-  signal s_prev_u   : signed(7 downto 0)  := (others => '0');
-  signal s_prev_v   : signed(7 downto 0)  := (others => '0');
+  signal s_prev_y : signed(11 downto 0) := (others => '0');
+  signal s_cur_y  : signed(11 downto 0);
 
-  signal s_cur_y : signed(11 downto 0);
-  signal s_cur_u : signed(7 downto 0);
-  signal s_cur_v : signed(7 downto 0);
+  -- ------- Y lane output -----------------------------------------------------
+  signal s_org_y : std_logic_vector(9 downto 0);
 
-  -- ------- lane outputs ------------------------------------------------------
-  signal s_org_y, s_org_u, s_org_v : std_logic_vector(9 downto 0);
-
-  -- ------- sync + dry Y/U/V circular delay (64 x 34 = 3 EBR) ------------------
+  -- ------- sync + dry-Y + U/V passthrough circular delay (64 x 34 = 3 EBR) ----
+  -- Carries dryY (Y fader tap) + U/V (passthrough) + sync, all delayed to 44.
   type t_dly is array (0 to 63) of std_logic_vector(33 downto 0);
   signal s_dly_ram : t_dly := (others => (others => '0'));
   signal s_wa      : unsigned(5 downto 0) := (others => '0');
   signal s_rd_q    : std_logic_vector(33 downto 0) := (others => '0');
   signal s_rd_q2   : std_logic_vector(33 downto 0) := (others => '0');
 
-  signal s_dry_y, s_dry_u, s_dry_v : std_logic_vector(9 downto 0);
+  signal s_dry_y : std_logic_vector(9 downto 0);
 
-  -- ------- sync +4 tail (44 -> 48, align with interpolator output) -----------
-  type t_sync4 is array (0 to 3) of std_logic_vector(3 downto 0);
-  signal s_sync_tail : t_sync4 := (others => (others => '1'));
+  -- ------- U/V + sync +4 tail (44 -> 48, align with the Y interpolator) -------
+  -- 24 bits = passU10 + passV10 + avid/hs/vs/fld. U/V skip the fader (dry=wet
+  -- passthrough) so they ride this tail to reach the same 48 as the faded Y.
+  type t_uvs4 is array (0 to 3) of std_logic_vector(23 downto 0);
+  signal s_uvs_tail : t_uvs4 := (others => (others => '1'));
 
-  -- ------- fader outputs -----------------------------------------------------
-  signal s_wet_u, s_wet_v          : unsigned(9 downto 0);
-  signal s_mix_y, s_mix_u, s_mix_v : unsigned(9 downto 0);
+  -- ------- Y fader output ----------------------------------------------------
+  signal s_mix_y : unsigned(9 downto 0);
 
 begin
 
@@ -684,8 +696,8 @@ begin
   -- REGEN address pipeline + line-buffer read/write (freeze-during-blank, R7).
   --   read  @ s_qidx (Q1 time)  -> prev-line coeff at Q2
   --   write @ s_qidx delayed 2  -> resonant coeff produced at Q2
-  -- Both Y and packed U/V buffers share the address. Writes gated by qavid AND
-  -- not-hold (Spectral Hold freezes the buffer).
+  -- Single Y coeff buffer. Writes gated by qavid AND not-hold (Spectral Hold
+  -- freezes the buffer).
   -- ==========================================================================
   p_regen_ctl : process(clk)
   begin
@@ -712,27 +724,24 @@ begin
   p_regen_rd : process(clk)
   begin
     if rising_edge(clk) then
-      -- registered reads (prev line) -> arrive at the lanes' Q2
+      -- registered read (prev line) -> arrives at the Y lane's Q2
       s_prev_y <= signed(ram_y(to_integer(s_qidx)));
-      s_prev_u <= signed(ram_uv(to_integer(s_qidx))(15 downto 8));
-      s_prev_v <= signed(ram_uv(to_integer(s_qidx))(7 downto 0));
     end if;
   end process;
 
   p_regen_wr : process(clk)
   begin
     if rising_edge(clk) then
-      -- writes (this line's resonant coeff), frozen when Spectral Hold engaged
+      -- write (this line's resonant Y coeff), frozen when Spectral Hold engaged
       if s_wr_en = '1' then
-        ram_y(to_integer(s_wr_addr))  <= std_logic_vector(s_cur_y);
-        ram_uv(to_integer(s_wr_addr)) <= std_logic_vector(s_cur_u) &
-                                         std_logic_vector(s_cur_v);
+        ram_y(to_integer(s_wr_addr)) <= std_logic_vector(s_cur_y);
       end if;
     end if;
   end process;
 
   -- ==========================================================================
-  -- Three organ lanes (Y full-res REGEN, U/V packed 8-bit; U/V wider clamp).
+  -- Single Y organ lane (full-res REGEN, full feature set). U/V are passthrough
+  -- (see the circular delay below) — no U/V lane instances.
   -- ==========================================================================
   u_y : entity work.wht_organ_lane
     generic map (G_REGEN_W => 12, G_CLAMP_LO => 64, G_CLAMP_HI => 940)
@@ -747,35 +756,10 @@ begin
               coef_tap => s_tap_y,
               d_in => data_in.y, d_out => s_org_y);
 
-  u_u : entity work.wht_organ_lane
-    generic map (G_REGEN_W => 8, G_CLAMP_LO => 64, G_CLAMP_HI => 960)
-    port map (clk => clk, pos => s_pos,
-              q_th0 => s_q_th(0), q_th1 => s_q_th(1),
-              q_th2 => s_q_th(2), q_th3 => s_q_th(3),
-              scr_key => s_scr_key,
-              tilt_dir => s_tilt_dir, tilt_str => s_tilt_str,
-              regen_sh => s_regen_sh, regen_en => s_regen_en,
-              hold => s_hold,
-              regen_prev => s_prev_u, regen_cur => s_cur_u,
-              coef_tap => open,
-              d_in => data_in.u, d_out => s_org_u);
-
-  u_v : entity work.wht_organ_lane
-    generic map (G_REGEN_W => 8, G_CLAMP_LO => 64, G_CLAMP_HI => 960)
-    port map (clk => clk, pos => s_pos,
-              q_th0 => s_q_th(0), q_th1 => s_q_th(1),
-              q_th2 => s_q_th(2), q_th3 => s_q_th(3),
-              scr_key => s_scr_key,
-              tilt_dir => s_tilt_dir, tilt_str => s_tilt_str,
-              regen_sh => s_regen_sh, regen_en => s_regen_en,
-              hold => s_hold,
-              regen_prev => s_prev_v, regen_cur => s_cur_v,
-              coef_tap => open,
-              d_in => data_in.v, d_out => s_org_v);
-
   -- ==========================================================================
-  -- Sync + dry Y/U/V circular delay (44). Pure delay -> runs unconditionally
-  -- (blanking-safe). Dry paths ride BRAM, not FF (saves ~440 FF/ch, A7).
+  -- Sync + dry-Y + U/V passthrough circular delay (44). Pure delay -> runs
+  -- unconditionally (blanking-safe). dryY feeds the Y fader; U/V + sync feed the
+  -- +4 tail. Data rides BRAM, not FF (saves ~440 FF/ch, A7).
   -- ==========================================================================
   p_dly : process(clk)
   begin
@@ -790,17 +774,15 @@ begin
   end process;
 
   s_dry_y <= s_rd_q2(33 downto 24);
-  s_dry_u <= s_rd_q2(23 downto 14);
-  s_dry_v <= s_rd_q2(13 downto 4);
 
-  -- Chroma toggle (Tog 11): RESERVED/INERT, fixed-on. Chroma ALWAYS flows through
-  -- the organ now (the "Luma only" bypass is retired); s_chroma is read but not
-  -- acted on. U/V wet = organ output unconditionally.
-  s_wet_u <= unsigned(s_org_u);
-  s_wet_v <= unsigned(s_org_v);
+  -- Chroma toggle (Tog 11): RESERVED/INERT. U/V are PASSTHROUGH (dry=wet, no
+  -- blend), not organ-processed; s_chroma is read but not acted on. U/V + sync
+  -- take the +4 tail below to reach 48 (the Y fader output depth). Passthrough
+  -- does no arithmetic, so U/V need no R1 clamp (input is already in-range).
 
   -- ==========================================================================
-  -- Dry/wet fader : interpolator_u per channel (principle #4). +4 clocks.
+  -- Dry/wet fader : ONE interpolator_u, on Y only (principle #4). +4 clocks.
+  -- U/V carry no fader (passthrough). The single * in the design lives here.
   -- ==========================================================================
   mix_y : entity work.interpolator_u
     generic map (G_WIDTH => C_VIDEO_DATA_WIDTH, G_FRAC_BITS => C_VIDEO_DATA_WIDTH,
@@ -809,44 +791,31 @@ begin
               a => unsigned(s_dry_y), b => unsigned(s_org_y),
               t => s_fader, result => s_mix_y, valid => open);
 
-  mix_u : entity work.interpolator_u
-    generic map (G_WIDTH => C_VIDEO_DATA_WIDTH, G_FRAC_BITS => C_VIDEO_DATA_WIDTH,
-                 G_OUTPUT_MIN => 64, G_OUTPUT_MAX => 960)
-    port map (clk => clk, enable => '1',
-              a => unsigned(s_dry_u), b => s_wet_u,
-              t => s_fader, result => s_mix_u, valid => open);
-
-  mix_v : entity work.interpolator_u
-    generic map (G_WIDTH => C_VIDEO_DATA_WIDTH, G_FRAC_BITS => C_VIDEO_DATA_WIDTH,
-                 G_OUTPUT_MIN => 64, G_OUTPUT_MAX => 960)
-    port map (clk => clk, enable => '1',
-              a => unsigned(s_dry_v), b => s_wet_v,
-              t => s_fader, result => s_mix_v, valid => open);
-
   -- ==========================================================================
-  -- Sync +4 tail : advance the 44-delayed sync bits to 48 (interpolator tail),
-  -- keeping data_out.sync aligned with the faded pixels — a FIXED delay,
-  -- independent of every knob/toggle/fader (R5/R8).
+  -- U/V + sync +4 tail : advance the 44-delayed U/V passthrough AND sync bits to
+  -- 48 (interpolator tail), keeping U/V + data_out.sync aligned with the faded Y
+  -- — a FIXED delay, independent of every knob/toggle/fader (R5/R8).
   -- ==========================================================================
-  p_sync_tail : process(clk)
+  p_uvs_tail : process(clk)
   begin
     if rising_edge(clk) then
-      s_sync_tail(0) <= s_rd_q2(3 downto 0);   -- avid,hs,vs,fld at 44
-      s_sync_tail(1) <= s_sync_tail(0);
-      s_sync_tail(2) <= s_sync_tail(1);
-      s_sync_tail(3) <= s_sync_tail(2);        -- now at 48
+      s_uvs_tail(0) <= s_rd_q2(23 downto 0);   -- U,V,avid,hs,vs,fld at 44
+      s_uvs_tail(1) <= s_uvs_tail(0);
+      s_uvs_tail(2) <= s_uvs_tail(1);
+      s_uvs_tail(3) <= s_uvs_tail(2);          -- now at 48
     end if;
   end process;
 
   -- ==========================================================================
   -- Output assignment (every data_out port driven exactly once, R2).
+  --   Y  = faded organ (48).   U/V = passthrough via the +4 tail (48).
   -- ==========================================================================
   data_out.y       <= std_logic_vector(s_mix_y);
-  data_out.u       <= std_logic_vector(s_mix_u);
-  data_out.v       <= std_logic_vector(s_mix_v);
-  data_out.avid    <= s_sync_tail(3)(3);
-  data_out.hsync_n <= s_sync_tail(3)(2);
-  data_out.vsync_n <= s_sync_tail(3)(1);
-  data_out.field_n <= s_sync_tail(3)(0);
+  data_out.u       <= s_uvs_tail(3)(23 downto 14);
+  data_out.v       <= s_uvs_tail(3)(13 downto 4);
+  data_out.avid    <= s_uvs_tail(3)(3);
+  data_out.hsync_n <= s_uvs_tail(3)(2);
+  data_out.vsync_n <= s_uvs_tail(3)(1);
+  data_out.field_n <= s_uvs_tail(3)(0);
 
 end architecture sequency;
