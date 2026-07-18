@@ -1,0 +1,14 @@
+# GHDL analysis/elaboration artifacts
+*.o
+*.cf
+e~*
+work-obj*.cf
+# elaborated simulation executables (no extension)
+tb_sequency_corners
+tb_sequency_fader
+tb_sequency_inert
+tb_sequency_null
+tb_sequency_probe
+tb_sequency_state
+*.ghw
+*.vcd
