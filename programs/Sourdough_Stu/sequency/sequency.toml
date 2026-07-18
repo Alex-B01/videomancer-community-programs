@@ -1,0 +1,175 @@
+# Copyright (C) 2026 AB (Sourdough_Stu)
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# SEQUENCY - Walsh-Hadamard organ (LUMA-ONLY v1).  Program 5.
+# NOTE: the all-timings key is intentionally OMITTED -- its absence IS the
+# all-formats declaration (block tiling self-calibrates from avid edges; no
+# framebuffer, no temporal state).  Musical knob scaling lives here
+# (control_mode / value_labels), not in fabric.
+# v1 is Y-only: Knob 5 (Crosstalk) and Toggle 11 (Chroma) are declared to keep
+# 12 controls + a forward-compatible panel legend, but are READ-AND-IGNORED in
+# fabric (inert) until the future chroma-through-organ variant.
+
+[program]
+program_id = "com.sourdoughstu.sequency"
+program_name = "Sequency"
+program_version = "1.0.0"
+abi_version = ">=1.0,<2.0"
+author = "AB (Sourdough_Stu)"
+license = "GPL-3.0"
+categories = ["Signal", "Pattern", "Glitch"]
+program_type = "processing"
+description = "Luma Walsh-Hadamard organ: 16-px spectral blocks played with quantize, tilt, scramble, regen, adapt."
+hardware_compatibility = ["rev_a", "rev_b"]
+core = "yuv444_30b"
+url = "https://github.com/lzxindustries/videomancer-community-programs"
+
+# ---------------------------------------------------------------------------
+# Knobs
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_1"
+name_label = "Quantize"
+control_mode = "quad_in"          # gentle onset
+display_min_value = 0
+display_max_value = 100
+initial_value = 0
+display_float_digits = 0
+suffix_label = "%"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_2"
+name_label = "Tilt"
+control_mode = "linear"           # bipolar, 512 = flat
+display_min_value = -100
+display_max_value = 100
+initial_value = 512
+display_float_digits = 0
+suffix_label = "%"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_3"
+name_label = "Scramble"
+control_mode = "linear"           # basis XOR permutation depth
+display_min_value = 0
+display_max_value = 100
+initial_value = 0
+display_float_digits = 0
+suffix_label = "%"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_4"
+name_label = "Regen"
+control_mode = "quart_out"        # fine near resonance; fabric clamps loop gain < 1
+display_min_value = 0
+display_max_value = 100
+initial_value = 0
+display_float_digits = 0
+suffix_label = "%"
+
+# Knob 5 (Crosstalk): v1 RESERVED / INERT -- read but not acted on (no chroma
+# path in v1).  Declared to preserve 12 controls + forward-compat legend.
+[[parameter]]
+parameter_id = "rotary_potentiometer_5"
+name_label = "Crosstalk"
+control_mode = "quad_in"
+display_min_value = 0
+display_max_value = 100
+initial_value = 0
+display_float_digits = 0
+suffix_label = "%"
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_6"
+name_label = "Adapt"
+control_mode = "linear"           # energy -> quantizer self-mod (intra-frame)
+display_min_value = 0
+display_max_value = 100
+initial_value = 0
+display_float_digits = 0
+suffix_label = "%"
+
+# ---------------------------------------------------------------------------
+# Toggles.  Tog7/Tog8 are v1 single-state: the retired-mode position is read
+# but INERT (fabric always does Hard / XOR).  Labels kept for forward-compat.
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "toggle_switch_7"
+name_label = "Quantizer"
+value_labels = ["Hard", "Dithered"]
+initial_value_label = "Hard"
+
+[[parameter]]
+parameter_id = "toggle_switch_8"
+name_label = "Scramble Mode"
+value_labels = ["XOR", "Rotate"]
+initial_value_label = "XOR"
+
+[[parameter]]
+parameter_id = "toggle_switch_9"
+name_label = "Adapt Polarity"
+value_labels = ["Normal", "Inverted"]
+initial_value_label = "Normal"
+
+[[parameter]]
+parameter_id = "toggle_switch_10"
+name_label = "Spectral Hold"
+value_labels = ["Live", "Hold"]
+initial_value_label = "Live"
+
+# Toggle 11 (Chroma): v1 RESERVED / INERT -- fixed "Luma only" in fabric.
+[[parameter]]
+parameter_id = "toggle_switch_11"
+name_label = "Chroma"
+value_labels = ["Luma only", "Chroma too"]
+initial_value_label = "Luma only"
+
+# ---------------------------------------------------------------------------
+# Fader
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "linear_potentiometer_12"
+name_label = "Dry / Wet"
+control_mode = "linear"
+display_min_value = 0
+display_max_value = 100
+initial_value = 0
+display_float_digits = 0
+suffix_label = "%"
+
+# ---------------------------------------------------------------------------
+# Factory presets
+# ---------------------------------------------------------------------------
+
+# Presets set only the active v1 controls; the reserved Knob 5 / Toggle 11
+# are left at their (inert) defaults.
+
+[[preset]]
+name = "Clean"
+rotary_potentiometer_1 = 0
+rotary_potentiometer_2 = 512
+rotary_potentiometer_3 = 0
+rotary_potentiometer_4 = 0
+rotary_potentiometer_6 = 0
+toggle_switch_7 = 0
+toggle_switch_8 = 0
+toggle_switch_9 = 0
+toggle_switch_10 = 0
+linear_potentiometer_12 = 0
+
+[[preset]]
+name = "Bitrate Starve"
+rotary_potentiometer_1 = 720
+rotary_potentiometer_2 = 700
+rotary_potentiometer_6 = 512
+linear_potentiometer_12 = 900
+
+[[preset]]
+name = "Regen Bloom"
+rotary_potentiometer_2 = 320
+rotary_potentiometer_4 = 820
+rotary_potentiometer_3 = 180
+linear_potentiometer_12 = 1023
