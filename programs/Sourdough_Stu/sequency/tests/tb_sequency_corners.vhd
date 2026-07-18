@@ -2,22 +2,37 @@
 -- tb_sequency_corners.vhd  --  SEQUENCY Gate 2 five-corner functional testbench
 -- ----------------------------------------------------------------------------
 -- Drives program_top(sequency) across one broadcast corner (G_CORNER selects
--- NTSC/720p60/1080p30/1080i5994/1080p24) with TRUE horizontal blanking geometry
--- and reduced-raster vertical geometry (fast sim; SEQUENCY has no vblank pass,
--- hook #9).  Phased register scenarios exercise the spec S6 verification hooks:
+-- NTSC/720p60/1080p30/1080i5994/1080p24 [+480p/PAL SD extras]) with TRUE
+-- horizontal blanking geometry and reduced-raster vertical geometry (fast sim;
+-- SEQUENCY has no vblank pass, hook #9).  Phased register scenarios exercise the
+-- spec S6 verification hooks:
 --
---   #1  Y round-trip identity  (neutral knobs, fader wet -> out.y == in.y d28)
+--   #1  Y round-trip identity  (neutral knobs, fader wet -> out.y == in.y d52)
 --   #2  block alignment / div16 (active px/line, exp_blocks completions/line)
---   #5  U/V passthrough         (out.u/v == in.u/v d28, legal-range content)
---   #7  latency / sync          (all sync bits == in delayed EXACTLY 28)
---   #9  no-vblank-compute null  (no coeff-buffer writes in deep vblank)
+--   #5  U/V passthrough         (out.u/v == in.u/v d52, legal-range content)
+--   #7  latency / sync          (all sync bits == in delayed EXACTLY 52)
 --   #10 broadcast-safe clamp    (out.y in [64,940], out.u/v in [64,960] always)
+--
+-- LATENCY = 52 (Gate-1 REGEN timing fix: organ core 48 /4 + interpolator tail 4;
+-- C_SYNC_DELAY_CLKS = 52). Every latency assertion here is 52 — the pre-fix 28/44
+-- values are RETIRED. Measured true latency independently = 52 (bit-exact organ
+-- round-trip at 52; probe in evidence/).
+--
+-- LATENCY-MEASUREMENT robustness (re-baseline fix): data_out ports ride
+-- s_uvs_tail, which INITIALISES to all-1s (iCE40 has no reset), so data_out.avid
+-- reads '1' at t=0 before any real pixel. The old "first-ever rising edge"
+-- detector latched that startup garbage and reported a NEGATIVE latency
+-- (lat_out=1 - lat_in=~281 = -281). The measurement now waits past WARMCYC (tail
+-- flushed) and times ONE clean input->output avid edge pair.
 --
 -- Emits machine-readable "RESULT <hook>: PASS|FAIL ..." lines consumed by the
 -- run script; logs the measured input->output avid latency for #7.
 --
--- NOTE (verifier): NEVER edits program VHDL. Observes internal state through
--- VHDL-2008 external names (dut.s_v, dut.s_wr_en) only.
+-- NOTE (verifier): NEVER edits program VHDL. Pure black-box harness — this GHDL
+-- build (6.0.0-dev) NULL-derefs on VHDL-2008 external names (reproduced), so
+-- internal-state hooks (#3/#4) live in tb_sequency_state; block tiling (#2) is
+-- verified from avid geometry + identity (#1), which cannot pass unless the DUT's
+-- internal div16 tiling is exact.
 -- ============================================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -32,7 +47,7 @@ use work.video_corner_pkg.all;
 
 entity tb_sequency_corners is
   generic (
-    G_CORNER    : integer := 2;    -- 0 NTSC .1 720p60 .2 1080p30 .3 1080i5994 .4 1080p24
+    G_CORNER    : integer := 2;    -- 0 NTSC .1 720p60 .2 1080p30 .3 1080i5994 .4 1080p24 .5 480p .6 PAL
     G_ACT_LINES : integer := 16;   -- active lines per field (reduced raster)
     G_VBL_LINES : integer := 6     -- blank lines per field
   );
@@ -46,9 +61,9 @@ architecture tb of tb_sequency_corners is
   constant AVS : integer := CPL - AW;                 -- blank-first: avid start
   constant LPF : integer := G_ACT_LINES + G_VBL_LINES; -- lines per field
   constant ILV : boolean := CORNERS(G_CORNER).is_interlaced;
-  constant D   : integer := 28;                       -- spec latency
+  constant D   : integer := 52;                       -- spec latency (Gate-1 fix)
   constant STOP_FIELD : integer := 5;   -- 0 warmup .1-2 neutral .3-4 adversarial
-  constant WARMCYC    : integer := 200;
+  constant WARMCYC    : integer := 2*CPL;             -- >= 1 full line + pipeline flush
 
   signal clk : std_logic := '0';
   signal running : boolean := true;
@@ -63,19 +78,13 @@ architecture tb of tb_sequency_corners is
   signal cur_field  : integer := 0;   -- field counter (phase driver)
   signal fldn_val   : std_logic := '1';
 
-  -- 28-deep shadow of the input stream (expected output = sh(D))
+  -- D-deep shadow of the input stream (expected output = sh(D))
   type sl_arr  is array (1 to D) of std_logic;
   type v10_arr is array (1 to D) of std_logic_vector(9 downto 0);
   type int_arr is array (1 to D) of integer;
   signal sh_avid, sh_hs, sh_vs, sh_fld : sl_arr  := (others => '0');
   signal sh_y, sh_u, sh_v              : v10_arr := (others => (others => '0'));
   signal sh_ac, sh_gl                  : int_arr := (others => 0);
-
-  -- NOTE: pure black-box harness. This GHDL build (6.0.0-dev, mcode) crashes on
-  -- VHDL-2008 external names (null-access), so internal-state hooks (#3/#4) are
-  -- covered by a separate waveform-dump TB; block tiling (#2) is verified from
-  -- avid geometry + the identity hook (#1), which cannot pass unless the DUT's
-  -- internal div16 tiling is exact.
 
   function neutral_phase(f : integer) return boolean is
   begin
@@ -116,6 +125,7 @@ begin
       r(1) := std_logic_vector(to_unsigned(1023, 10));  -- TILT max (cut bass)
       r(2) := std_logic_vector(to_unsigned(1023, 10));  -- SCRAMBLE max
       r(3) := std_logic_vector(to_unsigned(1023, 10));  -- REGEN max
+      r(4) := std_logic_vector(to_unsigned(1023, 10));  -- CROSSTALK max (reserved/inert)
       r(5) := std_logic_vector(to_unsigned(1023, 10));  -- ADAPT max
       if cur_field = 4 then
         r(6) := std_logic_vector(to_unsigned(4, 10));   -- tog9 ADAPT polarity inverted (bit2)
@@ -153,7 +163,7 @@ begin
       if act then
         data_in.avid <= '1';
         if neutral_phase(fld) then
-          yv := 64 + ((ac*7 + gl*13)       mod 800);   -- [64,863]  legal
+          yv := 64 + ((ac*7 + gl*13)       mod 800);   -- [64,863]  legal, in clamp
           uv := 64 + ((ac*5 + gl*3  + 30)  mod 850);   -- [64,913]  legal
           vv := 64 + ((ac*3 + gl*7  + 200) mod 850);   -- [64,913]  legal
         else
@@ -190,13 +200,12 @@ begin
         end if;
       else
         cx := cx + 1;
-        if (cx-1 >= AVS) and (cx-1 < AVS+0) then null; end if;  -- (no-op; readability)
       end if;
     end if;
   end process;
 
   -- ------------------------------------------------------------------
-  -- 28-deep input shadow: sh(k) = data_in delayed k cycles
+  -- D-deep input shadow: sh(k) = data_in delayed k cycles
   -- ------------------------------------------------------------------
   p_shadow : process(clk)
   begin
@@ -221,7 +230,9 @@ begin
     constant NAME : string := corner_name(G_CORNER);
     variable cyc  : integer := 0;
     variable pin, pout : std_logic := '0';
-    variable lat_in, lat_out : integer := -1;
+    -- robust latency measurement (one clean post-warmup edge pair)
+    variable lat_armed : boolean := false;
+    variable m_in, m_out, meas_lat : integer := -1;
     -- error counters
     variable e_sync, e_id, e_uv, e_clamp, e_blk : integer := 0;
     -- per-line block/px counters
@@ -233,11 +244,17 @@ begin
     if rising_edge(clk) then
       cyc := cyc + 1;
 
-      -- latency (#7): first input avid edge vs first output avid edge
-      if data_in.avid = '1' and pin = '0' and lat_in < 0 then lat_in := cyc; end if;
-      if data_out.avid = '1' and pout = '0' and lat_out < 0 then lat_out := cyc; end if;
+      -- latency (#7): time ONE clean input->output avid edge pair AFTER warmup
+      -- (past the all-1s s_uvs_tail startup garbage).
+      if cyc > WARMCYC then
+        if data_in.avid = '1' and pin = '0' and not lat_armed and meas_lat < 0 then
+          m_in := cyc; lat_armed := true;
+        elsif data_out.avid = '1' and pout = '0' and lat_armed then
+          m_out := cyc; meas_lat := m_out - m_in; lat_armed := false;
+        end if;
+      end if;
 
-      -- continuous sync passthrough (#7): out == in delayed exactly 28
+      -- continuous sync passthrough (#7): out == in delayed exactly D
       if cyc > WARMCYC then
         if (data_out.avid /= sh_avid(D)) or (data_out.hsync_n /= sh_hs(D)) or
            (data_out.vsync_n /= sh_vs(D)) or (data_out.field_n /= sh_fld(D)) then
@@ -317,7 +334,7 @@ begin
         report "==== SEQUENCY corner " & NAME & " (id=" &
                integer'image(CORNERS(G_CORNER).id) & ", " &
                integer'image(AW) & "px/line, " & integer'image(NB) & " blocks) ====";
-        report "MEASURED_LATENCY " & NAME & " = " & integer'image(lat_out - lat_in)
+        report "MEASURED_LATENCY " & NAME & " = " & integer'image(meas_lat)
           severity note;
         report "RESULT HOOK1_identity  " & NAME & ": " &
           str_pf(e_id = 0) & " (" & integer'image(e_id) & " mismatches)" severity note;
@@ -327,9 +344,9 @@ begin
         report "RESULT HOOK5_uvpass    " & NAME & ": " &
           str_pf(e_uv = 0) & " (" & integer'image(e_uv) & " mismatches)" severity note;
         report "RESULT HOOK7_latency   " & NAME & ": " &
-          str_pf((lat_out - lat_in) = D and e_sync = 0) & " (measured=" &
-          integer'image(lat_out - lat_in) & " sync_errs=" & integer'image(e_sync) & ")"
-          severity note;
+          str_pf(meas_lat = D and e_sync = 0) & " (measured=" &
+          integer'image(meas_lat) & " exp=" & integer'image(D) &
+          " sync_errs=" & integer'image(e_sync) & ")" severity note;
         report "RESULT HOOK10_clamp    " & NAME & ": " &
           str_pf(e_clamp = 0) & " (" & integer'image(e_clamp) & " out-of-range)" severity note;
         report "VIT_DONE corner " & NAME severity note;

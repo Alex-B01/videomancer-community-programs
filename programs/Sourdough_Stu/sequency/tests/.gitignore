@@ -10,5 +10,7 @@ tb_sequency_inert
 tb_sequency_null
 tb_sequency_probe
 tb_sequency_state
+tb_sequency_identity_adv
+tb_sequency_vblank
 *.ghw
 *.vcd
