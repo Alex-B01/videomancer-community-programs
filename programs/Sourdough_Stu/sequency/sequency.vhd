@@ -252,6 +252,11 @@ architecture sequency of program_top is
     signal s_prev_avid : std_logic := '0';
     signal s_ph    : unsigned(3 downto 0) := (others => '0');   -- block phase 0..15
     signal s_apx   : unsigned(ABITS-1 downto 0) := (others => '0'); -- active pixel idx
+    -- P2S ping-pong bank parity.  Derived from a dedicated FF (NOT s_apx(4)) so it
+    -- is reset to a deterministic line-start value: held '0' through blanking, so
+    -- block 0 of every line always uses bank 0 regardless of the prior line's
+    -- block-count parity (odd for 720-wide SD = 45 blocks).  See p_in.
+    signal s_blk_par : std_logic := '0';
     signal s_gather : t_pxv;    -- Y gather bank (S2P)
     signal s_xin    : t_fwd;    -- latched, centered Y block (transform input)
 
@@ -337,7 +342,8 @@ begin
             s_prev_avid <= data_in.avid;
 
             if data_in.avid = '1' and s_prev_avid = '0' then
-                -- avid rising: start of active line
+                -- avid rising: start of active line.  s_blk_par is already '0'
+                -- (held through blanking) so block 0 of every line uses bank 0.
                 s_ph  <= to_unsigned(1, 4);
                 s_apx <= to_unsigned(1, ABITS);
                 s_gather(0) <= data_in.y;
@@ -345,6 +351,7 @@ begin
                 s_gather(to_integer(s_ph)) <= data_in.y;
                 if s_ph = 15 then
                     s_ph <= (others => '0');
+                    s_blk_par <= not s_blk_par;   -- next block flips ping-pong parity
                     -- block complete: snapshot centered Y block into transform input
                     for i in 0 to 14 loop
                         s_xin(i) <= centr(s_gather(i));
@@ -354,6 +361,11 @@ begin
                     s_ph <= s_ph + 1;
                 end if;
                 s_apx <= s_apx + 1;
+            else
+                -- blanking: hold ping-pong parity at its deterministic line-start
+                -- value so the prior line's block-count parity cannot leak into
+                -- the first block of the next line (the SD odd-block identity bug).
+                s_blk_par <= '0';
             end if;
         end if;
     end process;
@@ -366,7 +378,7 @@ begin
         if rising_edge(clk) then
             if data_in.avid = '1' and s_ph = 15 then
                 s_v(0)    <= '1';
-                s_par(0)  <= s_apx(4);                        -- block-number parity
+                s_par(0)  <= s_blk_par;                       -- ping-pong parity (write side)
                 s_base(0) <= s_apx(ABITS-1 downto 4) & "0000"; -- block base addr
             else
                 s_v(0) <= '0';
@@ -579,9 +591,9 @@ begin
         variable y_d   : a10 := (others => (others => '0'));
     begin
         if rising_edge(clk) then
-            ph_d  := s_ph      & ph_d(0 to C_PRE-2);
-            par_d := s_apx(4)  & par_d(0 to C_PRE-2);
-            y_d   := data_in.y & y_d(0 to C_PRE-2);
+            ph_d  := s_ph       & ph_d(0 to C_PRE-2);
+            par_d := s_blk_par  & par_d(0 to C_PRE-2);   -- ping-pong parity (read side)
+            y_d   := data_in.y  & y_d(0 to C_PRE-2);
             out_ph_d  <= ph_d(C_PRE-1);
             out_par_d <= par_d(C_PRE-1);
             dry_y     <= y_d(C_PRE-1);
