@@ -1,14 +1,14 @@
 # Copyright (C) 2026 AB (Sourdough_Stu)
 # SPDX-License-Identifier: GPL-3.0-only
 #
-# SEQUENCY - Walsh-Hadamard organ (LUMA-ONLY v1).  Program 5.
+# SEQUENCY - Walsh-Hadamard organ (FULL-CHROMA, R2SDF).  Program 5.
 # NOTE: the all-timings key is intentionally OMITTED -- its absence IS the
 # all-formats declaration (block tiling self-calibrates from avid edges; no
 # framebuffer, no temporal state).  Musical knob scaling lives here
 # (control_mode / value_labels), not in fabric.
-# v1 is Y-only: Knob 5 (Crosstalk) and Toggle 11 (Chroma) are declared to keep
-# 12 controls + a forward-compatible panel legend, but are READ-AND-IGNORED in
-# fabric (inert) until the future chroma-through-organ variant.
+# Full-chroma committed build: a wht_organ_lane runs on each of Y/U/V.  Knob 5
+# (Crosstalk) and Toggle 11 (Chroma) are ACTIVE.  Toggles 7/8 carry inert
+# retired-mode positions (v1 fabric is always Hard / XOR).
 
 [program]
 program_id = "com.sourdoughstu.sequency"
@@ -19,7 +19,7 @@ author = "AB (Sourdough_Stu)"
 license = "GPL-3.0"
 categories = ["Signal", "Pattern", "Glitch"]
 program_type = "processing"
-description = "Luma Walsh-Hadamard organ: 16-px spectral blocks played with quantize, tilt, scramble, regen, adapt."
+description = "Full-chroma Walsh-Hadamard organ: Y/U/V spectral blocks played with quantize, tilt, scramble, regen, adapt, crosstalk."
 hardware_compatibility = ["rev_a", "rev_b"]
 core = "yuv444_30b"
 url = "https://github.com/lzxindustries/videomancer-community-programs"
@@ -41,7 +41,7 @@ suffix_label = "%"
 [[parameter]]
 parameter_id = "rotary_potentiometer_2"
 name_label = "Tilt"
-control_mode = "linear"           # bipolar, 512 = flat
+control_mode = "linear"           # bipolar, 512 = flat (attenuate-only)
 display_min_value = -100
 display_max_value = 100
 initial_value = 512
@@ -68,22 +68,22 @@ initial_value = 0
 display_float_digits = 0
 suffix_label = "%"
 
-# Knob 5 (Crosstalk): v1 RESERVED / INERT -- read but not acted on (no chroma
-# path in v1).  Declared to preserve 12 controls + forward-compat legend.
+# Knob 5 (Crosstalk): ACTIVE in full-chroma.  Bipolar around 512 (center = no
+# leakage); one side leaks luma->chroma, the other inverts the coupling.
 [[parameter]]
 parameter_id = "rotary_potentiometer_5"
 name_label = "Crosstalk"
-control_mode = "quad_in"
-display_min_value = 0
+control_mode = "linear"           # bipolar, 512 = no leakage
+display_min_value = -100
 display_max_value = 100
-initial_value = 0
+initial_value = 512
 display_float_digits = 0
 suffix_label = "%"
 
 [[parameter]]
 parameter_id = "rotary_potentiometer_6"
 name_label = "Adapt"
-control_mode = "linear"           # energy -> quantizer self-mod (intra-frame)
+control_mode = "linear"           # Y energy -> quantizer self-mod (intra-frame)
 display_min_value = 0
 display_max_value = 100
 initial_value = 0
@@ -119,12 +119,13 @@ name_label = "Spectral Hold"
 value_labels = ["Live", "Hold"]
 initial_value_label = "Live"
 
-# Toggle 11 (Chroma): v1 RESERVED / INERT -- fixed "Luma only" in fabric.
+# Toggle 11 (Chroma): ACTIVE.  "Chroma too" selects the x3 lane path (default);
+# "Luma only" leaves U/V as dry-delayed passthrough.
 [[parameter]]
 parameter_id = "toggle_switch_11"
 name_label = "Chroma"
 value_labels = ["Luma only", "Chroma too"]
-initial_value_label = "Luma only"
+initial_value_label = "Chroma too"
 
 # ---------------------------------------------------------------------------
 # Fader
@@ -144,20 +145,21 @@ suffix_label = "%"
 # Factory presets
 # ---------------------------------------------------------------------------
 
-# Presets set only the active v1 controls; the reserved Knob 5 / Toggle 11
-# are left at their (inert) defaults.
-
+# Clean = dry passthrough: all effect knobs neutral (Tilt/Crosstalk at 512
+# center), fader dry.  Neutral + wet round-trips bit-exact (WHT identity).
 [[preset]]
 name = "Clean"
 rotary_potentiometer_1 = 0
 rotary_potentiometer_2 = 512
 rotary_potentiometer_3 = 0
 rotary_potentiometer_4 = 0
+rotary_potentiometer_5 = 512
 rotary_potentiometer_6 = 0
 toggle_switch_7 = 0
 toggle_switch_8 = 0
 toggle_switch_9 = 0
 toggle_switch_10 = 0
+toggle_switch_11 = 1
 linear_potentiometer_12 = 0
 
 [[preset]]
@@ -173,3 +175,10 @@ rotary_potentiometer_2 = 320
 rotary_potentiometer_4 = 820
 rotary_potentiometer_3 = 180
 linear_potentiometer_12 = 1023
+
+[[preset]]
+name = "Chroma Bleed"
+rotary_potentiometer_1 = 300
+rotary_potentiometer_5 = 820
+rotary_potentiometer_2 = 640
+linear_potentiometer_12 = 1000
