@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Analyze SDK + SEQUENCY + harness once, then run tb_sequency_corners for each
-# corner index passed as arguments (default: all five 0..4).
+# corner index passed as arguments (default: all seven 0..6, incl. 480p/PAL SD).
 # Usage:  ./run_corners.sh [corner_indices...]
 set -euo pipefail
+
+# Reliable completion marker: a trap on EXIT fires even on early/error exit or a
+# non-zero grep under pipefail, so an auto-report waiter never orphans.
+trap 'rc=$?; echo "RUN_CORNERS_DONE (exit $rc)"' EXIT
 
 ROOT=/Users/hellomello/Developer/Videomancer
 SDK=$ROOT/videomancer-community-programs/videomancer-sdk
@@ -38,7 +42,7 @@ echo "== analyzing harness =="
 ghdl -a --std=08 -frelaxed --workdir="$WORK" "$TESTS/video_corner_pkg.vhd"
 ghdl -a --std=08 -frelaxed --workdir="$WORK" "$TESTS/tb_sequency_corners.vhd"
 
-CORNERS=("$@"); [ ${#CORNERS[@]} -eq 0 ] && CORNERS=(0 1 2 3 4)
+CORNERS=("$@"); [ ${#CORNERS[@]} -eq 0 ] && CORNERS=(0 1 2 3 4 5 6)
 for c in "${CORNERS[@]}"; do
   echo "== elaborate+run corner $c =="
   ghdl --elab-run --std=08 -frelaxed --workdir="$WORK" tb_sequency_corners \

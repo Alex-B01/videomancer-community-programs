@@ -23,7 +23,7 @@ use ieee.numeric_std.all;
 
 package video_corner_pkg is
 
-  constant C_NCORNERS : integer := 5;
+  constant C_NCORNERS : integer := 7;   -- 5 spec corners + 2 extra SD odd-block (480p/PAL)
 
   type t_corner is record
     id              : integer;   -- ABI video_timing_id (registers_in(8))
@@ -42,7 +42,10 @@ package video_corner_pkg is
     1 => (id => 14, clocks_per_line => 1650, active_width => 1280, exp_blocks =>  80, is_interlaced => false),
     2 => (id =>  7, clocks_per_line => 2200, active_width => 1920, exp_blocks => 120, is_interlaced => false),
     3 => (id =>  2, clocks_per_line => 2200, active_width => 1920, exp_blocks => 120, is_interlaced => true),
-    4 => (id =>  3, clocks_per_line => 2750, active_width => 1920, exp_blocks => 120, is_interlaced => false)
+    4 => (id =>  3, clocks_per_line => 2750, active_width => 1920, exp_blocks => 120, is_interlaced => false),
+    -- extra 720-wide SD corners (45 blocks = ODD): odd-block ping-pong regression class
+    5 => (id =>  4, clocks_per_line =>  858, active_width =>  720, exp_blocks =>  45, is_interlaced => false),  -- 480p (progressive)
+    6 => (id =>  8, clocks_per_line =>  864, active_width =>  720, exp_blocks =>  45, is_interlaced => true)     -- PAL  (interlaced)
   );
 
   function corner_name(i : integer) return string;
@@ -59,6 +62,8 @@ package body video_corner_pkg is
       when 2      => return "1080p30";
       when 3      => return "1080i5994";
       when 4      => return "1080p24";
+      when 5      => return "480p";
+      when 6      => return "PAL";
       when others => return "UNKNOWN";
     end case;
   end function;
