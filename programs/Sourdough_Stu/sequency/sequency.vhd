@@ -28,7 +28,7 @@
 --
 --   Y-ONLY committed topology: a single wht_organ_lane on Y with the FULL
 --   feature set (QUANTIZE/TILT/SCRAMBLE/REGEN/ADAPT + dry/wet fader). U and V
---   are PASSTHROUGH, delay-matched to the Y organ+fader latency (48) via the
+--   are PASSTHROUGH, delay-matched to the Y organ+fader latency (52) via the
 --   shared BRAM circular delay + the +4 interpolator-alignment tail (the
 --   sequency_sdf reference-prototype pattern). The U/V organ lanes and the
 --   packed U/V REGEN coefficient buffer are REMOVED. Shared control-derive
@@ -44,30 +44,39 @@
 --   decision (cut losses on full-chroma HD timing).
 --
 -- Pipeline stages + total latency:
---   Organ core (C_PROCESSING_DELAY_CLKS = 44, /4):
---     R  input register .................................. 1  (cum 1)
---     F1 forward SDF D=8  (W=12) ......................... 9  (cum 10)
---     F2 forward SDF D=4  (W=13) ......................... 5  (cum 15)
---     F3 forward SDF D=2  (W=14) ......................... 3  (cum 18)
---     F4 forward SDF D=1  (W=15) -> coeff stream ......... 2  (cum 20)
---     Q1 capture + TILT(atten) + SCRAMBLE-index + ADAPT tap  1  (cum 21)
---     Q2 REGEN add (TILT+REGEN, 2-input) + R3 sat + store .. 1  (cum 22)
---     Q3 QUANTIZE deadzone: band-select precomputed thr
---        (q_th0..3) + magnitude compare, DC exempt ....... 1  (cum 23)
---     I1 inverse SDF D=1  (W=17, widened +1) ............. 2  (cum 25)
---     I2 inverse SDF D=2  (W=18) ......................... 3  (cum 28)
---     I3 inverse SDF D=4  (W=19) ......................... 5  (cum 33)
---     I4 inverse SDF D=8  (W=20) -> reconstructed x16 .... 9  (cum 42)
---     S  +8 round, >>4 normalize, R1 broadcast clamp ..... 2  (cum 44)
---   Dry/wet fader (interpolator_u, Y only) ............... 4  -> total 48
---   => C_PROCESSING_DELAY_CLKS = 44 (organ), C_SYNC_DELAY_CLKS = 48 (= 44+4,
---      the interpolator tail; howler discipline). Sync + dry-Y + U/V passthrough
---      ride the BRAM circular delay (44); dry-Y feeds the Y fader (-> 48) and
---      U/V + sync ride a shared +4 tail so every data_out port is aligned at 48,
---      FIXED and independent of every knob/toggle/fader (R5/R8).
---      NOTE: spec headline "latency 44" = the organ core; the mandatory 4-clock
---      interpolator_u fader makes the sync-aligned end-to-end 48 (both /4). This
---      is the spec's own 44-vs-48 re-point (spec S1); flagged to orchestrator.
+--   Organ core (C_PROCESSING_DELAY_CLKS = 48, /4):
+--     R   input register ................................. 1  (cum 1)
+--     F1  forward SDF D=8  (W=12) ........................ 9  (cum 10)
+--     F2  forward SDF D=4  (W=13) ........................ 5  (cum 15)
+--     F3  forward SDF D=2  (W=14) ........................ 3  (cum 18)
+--     F4  forward SDF D=1  (W=15) -> coeff stream ........ 2  (cum 20)
+--     Q1  capture + TILT(atten) + SCRAMBLE-idx + ADAPT tap 1  (cum 21)
+--     Q2a REGEN BRAM-read isolation: register ram_y read +
+--         pre-shift/gate feedback term (Gate-1 timing fix)  1  (cum 22)
+--     Q2b REGEN add (TILT+REGEN, 2-input) + R3 sat + store  1  (cum 23)
+--     Q3  QUANTIZE deadzone: band-select precomputed thr
+--         (q_th0..3) + magnitude compare, DC exempt ...... 1  (cum 24)
+--     I1  inverse SDF D=1  (W=17, widened +1) ............ 2  (cum 26)
+--     I2  inverse SDF D=2  (W=18) ........................ 3  (cum 29)
+--     I3  inverse SDF D=4  (W=19) ........................ 5  (cum 34)
+--     I4  inverse SDF D=8  (W=20) -> reconstructed x16 ... 9  (cum 43)
+--     S   +8 round, >>4 normalize, R1 broadcast clamp .... 2  (cum 45)
+--     P   /4 sync-discipline pad (pure delay) ............ 3  (cum 48)
+--   Dry/wet fader (interpolator_u, Y only) ............... 4  -> total 52
+--   => C_PROCESSING_DELAY_CLKS = 48 (lane core incl. Q2a + /4 pad),
+--      C_SYNC_DELAY_CLKS = 52 (= 48+4, the interpolator tail; howler discipline).
+--      Sync + dry-Y + U/V passthrough ride the BRAM circular delay (48); dry-Y
+--      feeds the Y fader (-> 52) and U/V + sync ride a shared +4 tail so every
+--      data_out port is aligned at 52, FIXED and independent of every
+--      knob/toggle/fader (R5/R8).
+--      GATE-1 TIMING FIX (this build): the pre-fix organ was 44 (end-to-end 48)
+--      but Fmax stuck at 70.97 < 76 on the INTRINSIC REGEN Q2 store path (ram_y
+--      BRAM read -> 18b add -> R3 double-saturate -> reg, one clock). Q2 is now
+--      split: Q2a isolates the BRAM read (+ pre-shifts the feedback term) so the
+--      Q2b add + double-saturate start from fabric FFs. +1 real stage (organ 45);
+--      a +3 /4 pad -> lane 48, end-to-end 52 (both /4). REGEN is line-granular
+--      (~2048-clk loop) so the +1 read->write clock is behaviorally negligible;
+--      round-trip stays bit-exact at neutral / QUANTIZE=0. Gate 2 re-verifies.
 --
 -- EBR map (physical, power-of-two) — 9 EBR total:
 --   REGEN Y coeff line buffer   2048 x 12  (2048x2 mode)  1W/1R  = 6 EBR
@@ -93,20 +102,22 @@
 --   U+V REGEN store (ram_uv BRAM read -> 18b add + R3 sat -> write). User cut
 --   losses on full-chroma HD timing and reverted to the proven Y-only scope.
 --   Dropping the U/V organ lanes + the ram_uv buffer drops fill 88% -> 48% and
---   frees the congestion, BUT the REGEN feedback store is INTRINSIC, not
---   congestion: MEASURED Gate-1 smoke (hd_hdmi, seed 1) = 3,698 LC (48%) /
---   9 EBR / Fmax 70.97 MHz — LC & EBR comfortable, but Fmax STILL < the 76 gate
---   (up from the 3-lane 66.1, not cleared). Critical path = the Y REGEN Q2
---   store: ram_y BRAM read (2.15 ns clk-to-q) -> v_sum 18b add + R3 double-
---   saturate (s_c2 16b & s_cur_y 12b) -> register; the BRAM read feeding the
---   adder in a single clock is the wall (pre-route 74.75, also < 76 -> not seed
---   noise). Deeper fix = pipeline the REGEN add (BRAM-read -> reg -> add ->
---   store), which re-points latency 48 -> 52 (touches the REGEN loop + sync/dry
---   depth); OR a latency-neutral REGEN feedback-term retime (register the
---   shifted regen_prev off the adder's critical input, needs sim re-verify);
---   OR reduced REGEN precision. Each is an architectural tradeoff and the task
---   fixed latency at 48 -> NOT applied here; ESCALATED to the orchestrator. The
---   shared-threshold hoist (s_q_th -> q_th0..3) is KEPT. Latency 48 (/4).
+--   frees the congestion, BUT the REGEN feedback store was INTRINSIC, not
+--   congestion: the pre-fix Y-only smoke (hd_hdmi, seed 1) = 3,698 LC (48%) /
+--   9 EBR / Fmax 70.97 MHz — LC & EBR comfortable, but Fmax < the 76 gate on the
+--   Y REGEN Q2 store: ram_y BRAM read (2.15 ns clk-to-q) -> v_sum 18b add + R3
+--   double-saturate (s_c2 16b & s_cur_y 12b) -> register, one clock (pre-route
+--   74.75, also < 76 -> not seed noise).
+--   GATE-1 TIMING FIX (this build, approved Y-only scope): the Q2 stage is split
+--   — Q2a registers the ram_y read and pre-shifts/gates the feedback term OFF the
+--   arithmetic; Q2b does the add + double-saturate from fabric FFs (no BRAM
+--   clk-to-q, no barrel shift on that path). +1 real stage (organ 44->45) + a +3
+--   /4-discipline pad -> lane 48, end-to-end 52 (both /4). Costs ~0.1k LC (Q2a +
+--   pad + write-pipeline FFs); EBR unchanged (9). Post-fix smoke (hd_hdmi, seed
+--   1): 3,782 LC (49%) / 9 EBR / Fmax 89.85 MHz (+13.85 over the 76 gate) —
+--   comfortable clearance, as predicted at ~48% fill; the REGEN store is no
+--   longer the wall. The shared-threshold hoist (s_q_th -> q_th0..3) is KEPT.
+--   Latency 52 (/4).
 --
 -- Register map (SPI: pots -> registers_in(0..5), toggles -> (6) bits 0..4,
 --               fader -> (7), timing ID -> (8)(3 downto 0) [unused: all-formats]):
@@ -187,13 +198,31 @@ architecture rtl of wht_organ_lane is
 
   -- ------- Q-region registers (coeff/quant path widened 15 -> 16b) -----------
   signal s_c_tilt : signed(15 downto 0) := (others => '0');  -- Q1: forward coeff after TILT
-  signal s_c2     : signed(15 downto 0) := (others => '0');  -- Q2: post REGEN (R3 sat)
+  signal s_c2     : signed(15 downto 0) := (others => '0');  -- Q2b: post REGEN (R3 sat)
   signal s_c3     : signed(15 downto 0) := (others => '0');  -- Q3: post QUANTIZE deadzone
   signal s_seq1   : unsigned(3 downto 0) := (others => '0'); -- true sequency, pipelined
   signal s_seq2   : unsigned(3 downto 0) := (others => '0');
 
+  -- Q2a REGEN BRAM-read isolation registers (Gate-1 timing fix): capture the
+  -- ram_y read (regen_prev) + the pre-shifted/pre-gated feedback term OFF the
+  -- arithmetic, so the Q2b add starts from fabric FFs, not the BRAM output.
+  -- Breaks the 2.15 ns ram_y clk-to-q off the 18b add + double-saturate
+  -- (hardware-constraints Constraint 4). +1 pipeline stage (line-granular REGEN,
+  -- ~2048-clk loop -> behaviorally negligible; Gate 2 re-verifies).
+  signal s_regen_term : signed(17 downto 0) := (others => '0');           -- shifted+gated feedback
+  signal s_prev_y_r   : signed(G_REGEN_W - 1 downto 0) := (others => '0');-- isolated read (Hold replay)
+  signal s_c_tilt_d   : signed(15 downto 0) := (others => '0');           -- pipelined tilt coeff
+  signal s_seq1a      : unsigned(3 downto 0) := (others => '0');          -- pipelined sequency
+  signal s_hold_d     : std_logic := '0';                                -- pipelined Spectral Hold
+
   signal s_scaled : signed(19 downto 0) := (others => '0');
   signal s_d_out  : std_logic_vector(9 downto 0) := (others => '0');
+
+  -- P : /4 sync-discipline pad. The REGEN BRAM-read isolation (Q2a) adds 1 real
+  --     stage -> lane core 45; pad +3 so lane latency = 48 (still /4) and the
+  --     end-to-end sync depth stays /4 at 52 (hard rule). 3 x 10b = 30 FF.
+  type t_dpad is array (0 to 2) of std_logic_vector(9 downto 0);
+  signal s_dpad : t_dpad := (others => (others => '0'));
 
   -- ------- QUANTIZE per-sequency deadzone weighting (constant LUT) -----------
   -- Effective deadzone = qeff << C_QSHIFT[seq_eff]: high sequencies starve first.
@@ -206,8 +235,11 @@ architecture rtl of wht_organ_lane is
   constant OFF_F1 : integer := 0;  constant OFF_F2 : integer := 9;
   constant OFF_F3 : integer := 14; constant OFF_F4 : integer := 17;
   constant OFF_Q  : integer := 19;
-  constant OFF_I1 : integer := 22; constant OFF_I2 : integer := 24;
-  constant OFF_I3 : integer := 27; constant OFF_I4 : integer := 32;
+  -- Inverse offsets are +1 vs the pre-fix build: the Q2a REGEN BRAM-read
+  -- isolation stage delays the coefficient stream reaching the inverse SDF by
+  -- exactly one clock, so each inverse butterfly's mod-16 control phase shifts +1.
+  constant OFF_I1 : integer := 23; constant OFF_I2 : integer := 25;
+  constant OFF_I3 : integer := 28; constant OFF_I4 : integer := 33;
 
   -- R2SDF stage control: select bit = bit log2(D) of (pos - stage offset).
   function ctl(pos : unsigned(3 downto 0); off, bitn : integer) return std_logic is
@@ -324,40 +356,61 @@ begin
   coef_tap <= s_c_tilt;   -- Q1 register out; ADAPT tap (top consumes Y lane only)
 
   -- ==========================================================================
-  -- Q2 : REGEN vertical feedback add (2-input: TILT coeff + REGEN prev-line),
-  --      R3 saturating clamp to 16b, store the resonant AC coefficient (reduced
-  --      precision), and the Spectral-Hold source select. DC (true seq 0) is
-  --      excluded from feedback. (CROSSTALK inject removed — Gate-1 rework.)
+  -- Q2a : REGEN BRAM-read isolation (Gate-1 timing fix — hardware-constraints
+  --       Constraint 4). Register the ram_y read (regen_prev) and PRE-compute the
+  --       shifted + gated feedback term one clock early, so the Q2b add + double-
+  --       saturate below start from fabric FFs instead of the BRAM output — this
+  --       lifts the 2.15 ns ram_y clk-to-q (and the barrel shift) off the 18b add
+  --       + double-saturate critical path. Coeff / sequency / Hold are pipelined
+  --       alongside so Q2b stays aligned. This +1 stage is behaviorally negligible
+  --       (REGEN is line-granular, ~2048-clk loop); Gate 2 re-verifies semantics.
   -- ==========================================================================
-  p_q2 : process(clk)
-    variable v_regen : signed(17 downto 0);
-    variable v_sum   : signed(17 downto 0);
+  p_q2a : process(clk)
   begin
     if rising_edge(clk) then
-      -- REGEN feedback term: prev-line stored coeff >> (regen_sh+1)  (gain <= 1/2)
+      -- REGEN feedback term: prev-line stored coeff >> (regen_sh+1) (gain <= 1/2),
+      -- gated (DC seq 0 / REGEN off -> 0). Pre-shifted here, OFF the Q2b adder.
       if regen_en = '1' and s_seq1 /= 0 then
-        v_regen := shift_right(resize(regen_prev, 18),
-                               to_integer(regen_sh) + 1);
+        s_regen_term <= shift_right(resize(regen_prev, 18),
+                                    to_integer(regen_sh) + 1);
       else
-        v_regen := (others => '0');
+        s_regen_term <= (others => '0');
       end if;
-      v_sum := resize(s_c_tilt, 18) + v_regen;   -- 2-input add (no CROSSTALK term)
+      s_prev_y_r <= regen_prev;   -- isolated read, retained for the Hold replay
+      s_c_tilt_d <= s_c_tilt;
+      s_seq1a    <= s_seq1;
+      s_hold_d   <= hold;
+    end if;
+  end process;
 
-      if hold = '1' then
+  -- ==========================================================================
+  -- Q2b : REGEN vertical feedback add (2-input: TILT coeff + isolated feedback
+  --       term), R3 saturating clamp to 16b, store the resonant AC coefficient
+  --       (reduced precision), Spectral-Hold source select. DC (true seq 0) is
+  --       excluded from feedback + store. Inputs are all Q2a fabric FFs (no BRAM
+  --       clk-to-q, no barrel shift on this path). (CROSSTALK inject removed.)
+  -- ==========================================================================
+  p_q2b : process(clk)
+    variable v_sum : signed(17 downto 0);
+  begin
+    if rising_edge(clk) then
+      v_sum := resize(s_c_tilt_d, 18) + s_regen_term;  -- 2-input add, fabric inputs
+
+      if s_hold_d = '1' then
         -- Spectral Hold: replay the frozen (stored) coefficient into the inverse
-        s_c2 <= resize(regen_prev, 16);
+        s_c2 <= resize(s_prev_y_r, 16);
       else
         s_c2 <= sat_s(v_sum, 16);                 -- R3 clamp, coeff path 16b
       end if;
 
       -- store resonant coeff for next line (AC only; saturated to store width)
-      if s_seq1 = 0 then
+      if s_seq1a = 0 then
         regen_cur <= (others => '0');
       else
         regen_cur <= sat_s(v_sum, G_REGEN_W);
       end if;
 
-      s_seq2 <= s_seq1;
+      s_seq2 <= s_seq1a;
     end if;
   end process;
 
@@ -462,7 +515,22 @@ begin
     end if;
   end process;
 
-  d_out <= s_d_out;
+  -- ==========================================================================
+  -- P : /4 sync-discipline pad (+3). The REGEN BRAM-read isolation (Q2a) adds one
+  --     real stage (lane core 44 -> 45); this pad brings the lane latency to 48 so
+  --     the end-to-end sync depth stays divisible by 4 at 52 (hard rule). Pure
+  --     delay on the already-clamped output; no arithmetic.
+  -- ==========================================================================
+  p_pad : process(clk)
+  begin
+    if rising_edge(clk) then
+      s_dpad(0) <= s_d_out;
+      s_dpad(1) <= s_dpad(0);
+      s_dpad(2) <= s_dpad(1);
+    end if;
+  end process;
+
+  d_out <= s_dpad(2);
 
 end architecture rtl;
 
@@ -481,8 +549,11 @@ use work.core_pkg.all;
 
 architecture sequency of program_top is
 
-  constant C_PROCESSING_DELAY_CLKS : integer := 44;  -- organ core (/4)
-  constant C_SYNC_DELAY_CLKS       : integer := 48;  -- + interpolator (/4)
+  -- Latency re-pointed 44->48 / 48->52 by the Gate-1 REGEN timing fix: the Q2a
+  -- BRAM-read isolation adds 1 real stage (organ 44->45) and a +3 /4-discipline
+  -- pad brings the lane latency to 48. End-to-end (+interpolator 4) = 52, /4.
+  constant C_PROCESSING_DELAY_CLKS : integer := 48;  -- lane core incl. Q2a + /4 pad (/4)
+  constant C_SYNC_DELAY_CLKS       : integer := 52;  -- + interpolator (/4)
   constant C_LAT                   : integer := C_PROCESSING_DELAY_CLKS;
 
   -- REGEN address is generated in the Q1 stage's time frame. avid delayed to
@@ -537,8 +608,10 @@ architecture sequency of program_top is
   signal s_qavid    : std_logic := '0';                 -- avid delayed to Q1
   signal s_qa_sr    : std_logic_vector(0 to C_AVID_Q_DELAY - 1) := (others => '0');
   signal s_qidx     : unsigned(10 downto 0) := (others => '0');
+  signal s_wr_addr0 : unsigned(10 downto 0) := (others => '0');
   signal s_wr_addr1 : unsigned(10 downto 0) := (others => '0');
   signal s_wr_addr  : unsigned(10 downto 0) := (others => '0');
+  signal s_wr_en0   : std_logic := '0';
   signal s_wr_en1   : std_logic := '0';
   signal s_wr_en    : std_logic := '0';
   signal s_prev_y : signed(11 downto 0) := (others => '0');
@@ -548,7 +621,7 @@ architecture sequency of program_top is
   signal s_org_y : std_logic_vector(9 downto 0);
 
   -- ------- sync + dry-Y + U/V passthrough circular delay (64 x 34 = 3 EBR) ----
-  -- Carries dryY (Y fader tap) + U/V (passthrough) + sync, all delayed to 44.
+  -- Carries dryY (Y fader tap) + U/V (passthrough) + sync, all delayed to 48.
   type t_dly is array (0 to 63) of std_logic_vector(33 downto 0);
   signal s_dly_ram : t_dly := (others => (others => '0'));
   signal s_wa      : unsigned(5 downto 0) := (others => '0');
@@ -557,9 +630,9 @@ architecture sequency of program_top is
 
   signal s_dry_y : std_logic_vector(9 downto 0);
 
-  -- ------- U/V + sync +4 tail (44 -> 48, align with the Y interpolator) -------
+  -- ------- U/V + sync +4 tail (48 -> 52, align with the Y interpolator) -------
   -- 24 bits = passU10 + passV10 + avid/hs/vs/fld. U/V skip the fader (dry=wet
-  -- passthrough) so they ride this tail to reach the same 48 as the faded Y.
+  -- passthrough) so they ride this tail to reach the same 52 as the faded Y.
   type t_uvs4 is array (0 to 3) of std_logic_vector(23 downto 0);
   signal s_uvs_tail : t_uvs4 := (others => (others => '1'));
 
@@ -712,9 +785,13 @@ begin
         s_qidx <= s_qidx + 1;
       end if;
 
-      -- write address/enable pipeline: align to when regen_cur is valid (Q2)
-      s_wr_addr1 <= s_qidx;   s_wr_addr <= s_wr_addr1;
-      s_wr_en1   <= s_qavid and (not s_hold);
+      -- write address/enable pipeline: align to when regen_cur is valid. The Q2a
+      -- BRAM-read isolation pushed regen_cur one clock later (Q2 -> Q2b), so this
+      -- is now a 3-deep delay of s_qidx (was 2). Read stays ahead of write
+      -- (gap 2 -> 3 clocks, both << the ~2048-clock line) — no read/write hazard.
+      s_wr_addr0 <= s_qidx;   s_wr_addr1 <= s_wr_addr0;   s_wr_addr <= s_wr_addr1;
+      s_wr_en0   <= s_qavid and (not s_hold);
+      s_wr_en1   <= s_wr_en0;
       s_wr_en    <= s_wr_en1;
     end if;
   end process;
@@ -757,7 +834,7 @@ begin
               d_in => data_in.y, d_out => s_org_y);
 
   -- ==========================================================================
-  -- Sync + dry-Y + U/V passthrough circular delay (44). Pure delay -> runs
+  -- Sync + dry-Y + U/V passthrough circular delay (48). Pure delay -> runs
   -- unconditionally (blanking-safe). dryY feeds the Y fader; U/V + sync feed the
   -- +4 tail. Data rides BRAM, not FF (saves ~440 FF/ch, A7).
   -- ==========================================================================
@@ -777,7 +854,7 @@ begin
 
   -- Chroma toggle (Tog 11): RESERVED/INERT. U/V are PASSTHROUGH (dry=wet, no
   -- blend), not organ-processed; s_chroma is read but not acted on. U/V + sync
-  -- take the +4 tail below to reach 48 (the Y fader output depth). Passthrough
+  -- take the +4 tail below to reach 52 (the Y fader output depth). Passthrough
   -- does no arithmetic, so U/V need no R1 clamp (input is already in-range).
 
   -- ==========================================================================
@@ -792,14 +869,14 @@ begin
               t => s_fader, result => s_mix_y, valid => open);
 
   -- ==========================================================================
-  -- U/V + sync +4 tail : advance the 44-delayed U/V passthrough AND sync bits to
-  -- 48 (interpolator tail), keeping U/V + data_out.sync aligned with the faded Y
+  -- U/V + sync +4 tail : advance the 48-delayed U/V passthrough AND sync bits to
+  -- 52 (interpolator tail), keeping U/V + data_out.sync aligned with the faded Y
   -- — a FIXED delay, independent of every knob/toggle/fader (R5/R8).
   -- ==========================================================================
   p_uvs_tail : process(clk)
   begin
     if rising_edge(clk) then
-      s_uvs_tail(0) <= s_rd_q2(23 downto 0);   -- U,V,avid,hs,vs,fld at 44
+      s_uvs_tail(0) <= s_rd_q2(23 downto 0);   -- U,V,avid,hs,vs,fld at 48
       s_uvs_tail(1) <= s_uvs_tail(0);
       s_uvs_tail(2) <= s_uvs_tail(1);
       s_uvs_tail(3) <= s_uvs_tail(2);          -- now at 48
@@ -808,7 +885,7 @@ begin
 
   -- ==========================================================================
   -- Output assignment (every data_out port driven exactly once, R2).
-  --   Y  = faded organ (48).   U/V = passthrough via the +4 tail (48).
+  --   Y  = faded organ (52).   U/V = passthrough via the +4 tail (52).
   -- ==========================================================================
   data_out.y       <= std_logic_vector(s_mix_y);
   data_out.u       <= s_uvs_tail(3)(23 downto 14);
