@@ -29,7 +29,8 @@
 --
 --   Committed topology: a complete wht_organ_lane instantiated x3 (Y/U/V),
 --   fully INDEPENDENT (no cross-lane datapath coupling). Shared control-derive
---   (TILT strength/dir, SCRAMBLE key, ADAPT threshold) lives in the top; ADAPT
+--   (TILT strength/dir, SCRAMBLE key, ADAPT threshold, and the precomputed
+--   QUANTIZE deadzone thresholds q_th0..3) lives in the top; ADAPT
 --   is the only cross-lane influence (Y-energy -> all lanes' deadzone, a shared
 --   control, not a datapath tap). Knob 5 (CROSSTALK) and Toggle 11 (Chroma) are
 --   RESERVED/INERT (read, not acted on) after the Gate-1 rework dropped CROSSTALK.
@@ -43,7 +44,8 @@
 --     F4 forward SDF D=1  (W=15) -> coeff stream ......... 2  (cum 20)
 --     Q1 capture + TILT(atten) + SCRAMBLE-index + ADAPT tap  1  (cum 21)
 --     Q2 REGEN add (TILT+REGEN, 2-input) + R3 sat + store .. 1  (cum 22)
---     Q3 QUANTIZE deadzone (+ADAPT thr, DC exempt) ....... 1  (cum 23)
+--     Q3 QUANTIZE deadzone: band-select precomputed thr
+--        (q_th0..3) + magnitude compare, DC exempt ....... 1  (cum 23)
 --     I1 inverse SDF D=1  (W=17, widened +1) ............. 2  (cum 25)
 --     I2 inverse SDF D=2  (W=18) ......................... 3  (cum 28)
 --     I3 inverse SDF D=4  (W=19) ......................... 5  (cum 33)
@@ -73,14 +75,22 @@
 --   glue freed); it was the cross-lane V-tap -> mix -> Y-lane Q2 3-input add that
 --   crashed Fmax to 56.5 MHz. Multipliers in the organ: 0 (all shift/add). The
 --   only * in the design is inside the SDK interpolator_u x3 (sanctioned fader).
---   Gate-1 smoke MEASURED (hd_hdmi, seed 1): LC=6669/7680 (PASS) · EBR=17/20
---   (PASS) · Fmax=62.92 MHz -> FAIL (<76). CROSSTALK removal lifted Fmax
---   56.5 -> 62.92 but did NOT clear the gate. Residual critical path is the Q3
---   QUANTIZE deadzone, wholly inside a lane (s_seq2 -> SCRAMBLE xor -> qeff <<
---   C_QSHIFT barrel-shift -> +adapt_delta 17b add -> |s_c2| >= v_th 18b compare
---   -> s_c3 clear), a single-clock shift+add+wide-compare chain = 15.89 ns.
---   Deeper fix = pipeline the Q region (+1 Q stage, re-target organ latency);
---   ESCALATED to the orchestrator (out of scope for the surgical CROSSTALK drop).
+--   Gate-1 smoke history (hd_hdmi, seed 1): CROSSTALK removal 56.5 -> 62.92;
+--   Q3 THRESHOLD HOIST (this commit) 62.92 -> 66.14 MHz. LC=6779/7680 (PASS) ·
+--   EBR=17/20 (PASS) · Fmax=66.14 -> STILL FAIL (<76). The hoist moved the
+--   block-stable deadzone threshold ((qeff<<k)+ADAPT, clamped >=0) out of the
+--   per-coefficient path into a shared top precompute (s_q_th -> q_th0..3), so
+--   Q3 is now band-select + compare and is NO LONGER critical (bit-exact: thr=0
+--   at QUANTIZE=0; ADAPT block-phase shifts 1 clk, within tol). Latency 48 (/4)
+--   unchanged. NEW critical path MOVED to the REGEN Q2 store: ram_uv (packed U+V
+--   line buffer) BRAM read -> long route -> v_sum 18b add + R3 sat -> s_cur_v
+--   write = 15.02 ns (8.13 ns / 54% routing; BRAM-to-fabric hop + 88% fill).
+--   Slack histogram: only a handful of failing endpoints (targeted, not a global
+--   congestion wall). Deeper fix = pipeline the REGEN Q2 add (BRAM-read -> reg
+--   -> add -> store), which forces a latency re-point 48 -> 52 (/4) touching the
+--   REGEN feedback loop + shared s_c2 path + ADAPT tap + REGEN addr pipeline +
+--   sync/dry depth; OR a fill-reduction lever (4:2:2 half-rate chroma) OR
+--   SD-only. ESCALATED to the orchestrator (short-of-76 tradeoff decision).
 --
 -- Register map (SPI: pots -> registers_in(0..5), toggles -> (6) bits 0..4,
 --               fader -> (7), timing ID -> (8)(3 downto 0) [unused: all-formats]):
@@ -125,13 +135,18 @@ entity wht_organ_lane is
     clk         : in  std_logic;
     pos         : in  unsigned(3 downto 0);           -- avid-anchored mod-16 index
     -- shared control (derived once at top; identical to all 3 lanes)
-    qeff        : in  unsigned(9 downto 0);           -- QUANTIZE base threshold
+    -- QUANTIZE deadzone thresholds, precomputed per C_QSHIFT band (qeff<<k +
+    -- ADAPT, clamped >=0). Block-stable -> hoisted out of the per-coefficient Q3
+    -- critical path at the top (Gate-1 timing fix); the lane just band-selects.
+    q_th0       : in  signed(17 downto 0);            -- band k=0 threshold
+    q_th1       : in  signed(17 downto 0);            -- band k=1 threshold
+    q_th2       : in  signed(17 downto 0);            -- band k=2 threshold
+    q_th3       : in  signed(17 downto 0);            -- band k=3 threshold
     scr_key     : in  unsigned(3 downto 0);           -- SCRAMBLE index XOR key
     tilt_dir    : in  std_logic;                      -- 0 = cut highs (bass), 1 = cut lows
     tilt_str    : in  unsigned(1 downto 0);           -- runtime TILT strength 0..3
     regen_sh    : in  unsigned(1 downto 0);           -- REGEN feedback right-shift-1 (gain <=1/2)
     regen_en    : in  std_logic;                      -- REGEN enable (knob4 > 0)
-    adapt_delta : in  signed(15 downto 0);            -- shared ADAPT threshold modifier
     hold        : in  std_logic;                      -- Spectral Hold (freeze coeff source)
     -- REGEN storage seam (line-buffer RAM lives in the top so U/V can pack)
     regen_prev  : in  signed(G_REGEN_W - 1 downto 0);
@@ -165,7 +180,9 @@ architecture rtl of wht_organ_lane is
   signal s_d_out  : std_logic_vector(9 downto 0) := (others => '0');
 
   -- ------- QUANTIZE per-sequency deadzone weighting (constant LUT) -----------
-  -- Threshold = qeff << C_QSHIFT[seq_eff]: high sequencies starve first.
+  -- Effective deadzone = qeff << C_QSHIFT[seq_eff]: high sequencies starve first.
+  -- C_QSHIFT now selects which of the top's 4 precomputed thresholds (q_th0..3)
+  -- to compare against — the shift+add that built each threshold is hoisted.
   type t_qsh is array (0 to 15) of integer range 0 to 3;
   constant C_QSHIFT : t_qsh := (0,0,1,1, 2,2,2,2, 3,3,3,3, 3,3,3,3);
 
@@ -331,24 +348,35 @@ begin
   -- ==========================================================================
   -- Q3 : QUANTIZE hard deadzone. threshold = (qeff << C_QSHIFT[seq_eff]) + ADAPT.
   --      DC (true seq 0) exempt -> QUANTIZE=0 keeps everything (identity core).
+  --
+  --      TIMING FIX (Gate 1): the threshold is block-stable (qeff is per-frame,
+  --      ADAPT is per-block), so its shift + 17b add + >=0 clamp are precomputed
+  --      once per block at the top (q_th0..3, one per C_QSHIFT band). This clock
+  --      now does ONLY: band-select (xor + LUT + 4:1 mux) + magnitude compare +
+  --      select — no barrel-shift, no wide add, no clamp on the per-coeff path.
+  --      Bit-identical to the old inline threshold (same value, computed 1 clk
+  --      earlier); ADAPT's block phase shifts by 1 clk (heuristic, within tol),
+  --      identity is exact (thr=0 at QUANTIZE=0 regardless of phase).
   -- ==========================================================================
   p_q3 : process(clk)
     variable v_seff : unsigned(3 downto 0);
-    variable v_th   : signed(16 downto 0);
+    variable v_th   : signed(17 downto 0);
     variable v_mag  : unsigned(15 downto 0);
     variable v_keep : std_logic;
   begin
     if rising_edge(clk) then
       v_seff := s_seq2 xor scr_key;
-      v_th   := resize(signed('0' & shift_left(resize(qeff, 14),
-                                               C_QSHIFT(to_integer(v_seff)))), 17)
-                + resize(adapt_delta, 17);
-      if v_th < 0 then v_th := (others => '0'); end if;   -- threshold >= 0
-      v_mag  := unsigned(abs(s_c2));
+      case C_QSHIFT(to_integer(v_seff)) is           -- select precomputed band thr
+        when 0      => v_th := q_th0;
+        when 1      => v_th := q_th1;
+        when 2      => v_th := q_th2;
+        when others => v_th := q_th3;
+      end case;
+      v_mag := unsigned(abs(s_c2));
 
       if s_seq2 = 0 then
         v_keep := '1';                                    -- DC exempt
-      elsif resize(signed('0' & std_logic_vector(v_mag)), 18) >= resize(v_th, 18) then
+      elsif resize(signed('0' & std_logic_vector(v_mag)), 18) >= v_th then
         v_keep := '1';
       else
         v_keep := '0';
@@ -474,6 +502,15 @@ architecture sequency of program_top is
   signal s_en_acc  : unsigned(17 downto 0) := (others => '0');
   signal s_en_blk  : unsigned(17 downto 0) := (others => '0');
   signal s_adapt_d : signed(15 downto 0) := (others => '0');
+
+  -- ------- QUANTIZE deadzone thresholds (block-stable, hoisted from lane Q3) --
+  -- q_th(k) = (QUANTIZE << k) + ADAPT delta, clamped >=0, for each C_QSHIFT band
+  -- k=0..3. Depend only on QUANTIZE (per-frame) + ADAPT (per-block) -> stable
+  -- across a 16-coeff block, so each lane's per-coefficient Q3 reduces to a 4:1
+  -- select + compare. Computed once (shared by all 3 lanes) — Gate-1 timing fix
+  -- (removes the 17b add + barrel-shift + >=0 clamp from the critical path).
+  type t_qth is array (0 to 3) of signed(17 downto 0);
+  signal s_q_th : t_qth := (others => (others => '0'));
 
   -- ------- REGEN line buffers (owned here so U/V can pack) --------------------
   -- Y : 2048 x 12 = 6 EBR.  U+V packed : 2048 x 16 = 8 EBR.
@@ -622,6 +659,28 @@ begin
   end process;
 
   -- ==========================================================================
+  -- QUANTIZE threshold precompute (shared, block-stable). For each C_QSHIFT band
+  -- k, q_th(k) = (QUANTIZE << k) + ADAPT delta, clamped >= 0. Registered here
+  -- once instead of rebuilt in every lane's per-coefficient Q3 path (Gate-1
+  -- timing fix). QUANTIZE<<3 max = 1023*8 = 8184 (fits 14b); the sum fits 18b.
+  -- ==========================================================================
+  p_qth : process(clk)
+    variable v_raw : signed(17 downto 0);
+  begin
+    if rising_edge(clk) then
+      for k in 0 to 3 loop
+        v_raw := signed(resize(shift_left(resize(s_quant, 14), k), 18))
+                 + resize(s_adapt_d, 18);
+        if v_raw < 0 then
+          s_q_th(k) <= (others => '0');           -- threshold >= 0
+        else
+          s_q_th(k) <= v_raw;
+        end if;
+      end loop;
+    end if;
+  end process;
+
+  -- ==========================================================================
   -- REGEN address pipeline + line-buffer read/write (freeze-during-blank, R7).
   --   read  @ s_qidx (Q1 time)  -> prev-line coeff at Q2
   --   write @ s_qidx delayed 2  -> resonant coeff produced at Q2
@@ -677,30 +736,39 @@ begin
   -- ==========================================================================
   u_y : entity work.wht_organ_lane
     generic map (G_REGEN_W => 12, G_CLAMP_LO => 64, G_CLAMP_HI => 940)
-    port map (clk => clk, pos => s_pos, qeff => s_quant, scr_key => s_scr_key,
+    port map (clk => clk, pos => s_pos,
+              q_th0 => s_q_th(0), q_th1 => s_q_th(1),
+              q_th2 => s_q_th(2), q_th3 => s_q_th(3),
+              scr_key => s_scr_key,
               tilt_dir => s_tilt_dir, tilt_str => s_tilt_str,
               regen_sh => s_regen_sh, regen_en => s_regen_en,
-              adapt_delta => s_adapt_d, hold => s_hold,
+              hold => s_hold,
               regen_prev => s_prev_y, regen_cur => s_cur_y,
               coef_tap => s_tap_y,
               d_in => data_in.y, d_out => s_org_y);
 
   u_u : entity work.wht_organ_lane
     generic map (G_REGEN_W => 8, G_CLAMP_LO => 64, G_CLAMP_HI => 960)
-    port map (clk => clk, pos => s_pos, qeff => s_quant, scr_key => s_scr_key,
+    port map (clk => clk, pos => s_pos,
+              q_th0 => s_q_th(0), q_th1 => s_q_th(1),
+              q_th2 => s_q_th(2), q_th3 => s_q_th(3),
+              scr_key => s_scr_key,
               tilt_dir => s_tilt_dir, tilt_str => s_tilt_str,
               regen_sh => s_regen_sh, regen_en => s_regen_en,
-              adapt_delta => s_adapt_d, hold => s_hold,
+              hold => s_hold,
               regen_prev => s_prev_u, regen_cur => s_cur_u,
               coef_tap => open,
               d_in => data_in.u, d_out => s_org_u);
 
   u_v : entity work.wht_organ_lane
     generic map (G_REGEN_W => 8, G_CLAMP_LO => 64, G_CLAMP_HI => 960)
-    port map (clk => clk, pos => s_pos, qeff => s_quant, scr_key => s_scr_key,
+    port map (clk => clk, pos => s_pos,
+              q_th0 => s_q_th(0), q_th1 => s_q_th(1),
+              q_th2 => s_q_th(2), q_th3 => s_q_th(3),
+              scr_key => s_scr_key,
               tilt_dir => s_tilt_dir, tilt_str => s_tilt_str,
               regen_sh => s_regen_sh, regen_en => s_regen_en,
-              adapt_delta => s_adapt_d, hold => s_hold,
+              hold => s_hold,
               regen_prev => s_prev_v, regen_cur => s_cur_v,
               coef_tap => open,
               d_in => data_in.v, d_out => s_org_v);
