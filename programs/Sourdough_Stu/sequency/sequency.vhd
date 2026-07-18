@@ -21,16 +21,18 @@
 --   deadzone, barrel-shift + per-sequency LUT), TILT (runtime per-sequency
 --   attenuation, knob 2), SCRAMBLE (coefficient-index XOR), REGEN (vertical
 --   coefficient feedback via a line buffer, saturating, freeze-during-blank),
---   ADAPT (Y block-energy -> deadzone threshold, shared/Y-driven), CROSSTALK
---   (Y<->C leakage). Blended dry/wet via interpolator_u on all three channels.
+--   ADAPT (Y block-energy -> deadzone threshold, shared/Y-driven). Blended
+--   dry/wet via interpolator_u on all three channels. (CROSSTALK removed in the
+--   Gate-1 timing rework — see the LC note below.)
 --   No framebuffer, no temporal state -> natively all-formats. Block index =
 --   avid-anchored mod-16 counter (720/1280/1920 all divide by 16 exactly).
 --
---   Committed topology: a complete wht_organ_lane instantiated x3 (Y/U/V).
---   Shared control-derive (TILT strength/dir, SCRAMBLE key, ADAPT threshold)
---   and the CROSSTALK coupling live in the top, "in the seam" between the
---   lanes' forward and inverse chains. Knob 5 (CROSSTALK) and Toggle 11
---   (Chroma) are ACTIVE.
+--   Committed topology: a complete wht_organ_lane instantiated x3 (Y/U/V),
+--   fully INDEPENDENT (no cross-lane datapath coupling). Shared control-derive
+--   (TILT strength/dir, SCRAMBLE key, ADAPT threshold) lives in the top; ADAPT
+--   is the only cross-lane influence (Y-energy -> all lanes' deadzone, a shared
+--   control, not a datapath tap). Knob 5 (CROSSTALK) and Toggle 11 (Chroma) are
+--   RESERVED/INERT (read, not acted on) after the Gate-1 rework dropped CROSSTALK.
 --
 -- Pipeline stages + total latency:
 --   Organ core (C_PROCESSING_DELAY_CLKS = 44, /4):
@@ -39,8 +41,8 @@
 --     F2 forward SDF D=4  (W=13) ......................... 5  (cum 15)
 --     F3 forward SDF D=2  (W=14) ......................... 3  (cum 18)
 --     F4 forward SDF D=1  (W=15) -> coeff stream ......... 2  (cum 20)
---     Q1 capture + TILT(atten) + SCRAMBLE-index + tap .... 1  (cum 21)
---     Q2 REGEN add + CROSSTALK inject + R3 sat + store ... 1  (cum 22)
+--     Q1 capture + TILT(atten) + SCRAMBLE-index + ADAPT tap  1  (cum 21)
+--     Q2 REGEN add (TILT+REGEN, 2-input) + R3 sat + store .. 1  (cum 22)
 --     Q3 QUANTIZE deadzone (+ADAPT thr, DC exempt) ....... 1  (cum 23)
 --     I1 inverse SDF D=1  (W=17, widened +1) ............. 2  (cum 25)
 --     I2 inverse SDF D=2  (W=18) ......................... 3  (cum 28)
@@ -66,12 +68,19 @@
 --   TOTAL = 6 + 8 + 3 = 17 EBR   (budget MAX_EBR 20, device 32)
 --
 -- LC estimate (honest, paper): measured 3-lane R2SDF skeleton 4,415 LC + levered
---   feature deltas ~2,150 (REGEN/TILT/SCRAMBLE/ADAPT/CROSSTALK/fader + width
---   re-derivation) => ~6,600 LC (WARN band, ~600 under the 7,200 hard gate,
---   zero iteration headroom). Multipliers in the organ: 0 (all shift/add). The
+--   feature deltas ~2,000 (REGEN/TILT/SCRAMBLE/ADAPT/fader + width re-derivation)
+--   => ~6,450 LC paper. CROSSTALK REMOVED in the Gate-1 timing rework (~150 LC +
+--   glue freed); it was the cross-lane V-tap -> mix -> Y-lane Q2 3-input add that
+--   crashed Fmax to 56.5 MHz. Multipliers in the organ: 0 (all shift/add). The
 --   only * in the design is inside the SDK interpolator_u x3 (sanctioned fader).
---   A feature-complete Gate-1 synth smoke MEASURES this (STOP if LC>7200 or
---   any HD Fmax<76).
+--   Gate-1 smoke MEASURED (hd_hdmi, seed 1): LC=6669/7680 (PASS) · EBR=17/20
+--   (PASS) · Fmax=62.92 MHz -> FAIL (<76). CROSSTALK removal lifted Fmax
+--   56.5 -> 62.92 but did NOT clear the gate. Residual critical path is the Q3
+--   QUANTIZE deadzone, wholly inside a lane (s_seq2 -> SCRAMBLE xor -> qeff <<
+--   C_QSHIFT barrel-shift -> +adapt_delta 17b add -> |s_c2| >= v_th 18b compare
+--   -> s_c3 clear), a single-clock shift+add+wide-compare chain = 15.89 ns.
+--   Deeper fix = pipeline the Q region (+1 Q stage, re-target organ latency);
+--   ESCALATED to the orchestrator (out of scope for the surgical CROSSTALK drop).
 --
 -- Register map (SPI: pots -> registers_in(0..5), toggles -> (6) bits 0..4,
 --               fader -> (7), timing ID -> (8)(3 downto 0) [unused: all-formats]):
@@ -79,13 +88,13 @@
 --   Knob 2  registers_in(1)     TILT       bass<->treble, attenuate-only (512=flat)
 --   Knob 3  registers_in(2)     SCRAMBLE   basis permutation depth (index XOR)
 --   Knob 4  registers_in(3)     REGEN      vertical coefficient feedback
---   Knob 5  registers_in(4)     CROSSTALK  Y<->C leakage (bipolar, ACTIVE)
+--   Knob 5  registers_in(4)     CROSSTALK  RESERVED/INERT (read, not acted on)
 --   Knob 6  registers_in(5)     ADAPT      energy -> quantizer self-mod (Y-driven)
 --   Tog 7   registers_in(6)(0)  Quantizer  Hard/Dithered (Dithered inert v1)
 --   Tog 8   registers_in(6)(1)  ScrMode    XOR/Rotate    (Rotate inert v1)
 --   Tog 9   registers_in(6)(2)  ADAPT pol  Normal/Inverted
 --   Tog 10  registers_in(6)(3)  SpecHold   Live/Hold
---   Tog 11  registers_in(6)(4)  Chroma     Luma only / Chroma too (ACTIVE)
+--   Tog 11  registers_in(6)(4)  Chroma     RESERVED/INERT, fixed-on (read, ignored)
 --   Fader   registers_in(7)     Dry/Wet    interpolator_u crossfade
 --
 -- No resets (iCE40 has none): every register/BRAM relies on signal init.
@@ -94,11 +103,11 @@
 --------------------------------------------------------------------------------
 -- wht_organ_lane : one complete R2SDF Walsh-Hadamard organ (Y, U, or V).
 --   Forward SDF -> Q-region (per-lane feature apply) -> inverse SDF -> scale.
---   Cross-lane / shared seams exposed as ports:
---     coef_tap  : this lane's Q1 (tilted) coefficient, for CROSSTALK + ADAPT taps
---     xtalk_in  : cross contribution injected at Q2 (combinational from top)
+--   Lanes are INDEPENDENT (CROSSTALK removed in the Gate-1 rework). Shared seams:
+--     coef_tap  : this lane's Q1 (tilted) coefficient — ADAPT tap (Y lane only;
+--                 U/V leave it open)
 --     regen_prev: previous-line stored coefficient (RAM owned by top, packable)
---     regen_cur : this-line coefficient to store (post REGEN+CROSSTALK, saturated)
+--     regen_cur : this-line coefficient to store (post REGEN, saturated)
 --   Generics select the REGEN store width (12 = Y full-res, 8 = U/V packed) and
 --   the R1 broadcast-safe output clamp (Y [64,940], U/V [64,960]).
 --------------------------------------------------------------------------------
@@ -127,9 +136,8 @@ entity wht_organ_lane is
     -- REGEN storage seam (line-buffer RAM lives in the top so U/V can pack)
     regen_prev  : in  signed(G_REGEN_W - 1 downto 0);
     regen_cur   : out signed(G_REGEN_W - 1 downto 0);
-    -- CROSSTALK seam
+    -- ADAPT tap seam (Y lane only; U/V leave it open)
     coef_tap    : out signed(15 downto 0);            -- Q1 tilted coefficient
-    xtalk_in    : in  signed(15 downto 0);            -- cross contribution (0 when off)
     -- video datapath
     d_in        : in  std_logic_vector(9 downto 0);
     d_out       : out std_logic_vector(9 downto 0)
@@ -148,7 +156,7 @@ architecture rtl of wht_organ_lane is
 
   -- ------- Q-region registers (coeff/quant path widened 15 -> 16b) -----------
   signal s_c_tilt : signed(15 downto 0) := (others => '0');  -- Q1: forward coeff after TILT
-  signal s_c2     : signed(15 downto 0) := (others => '0');  -- Q2: post REGEN+CROSSTALK (R3 sat)
+  signal s_c2     : signed(15 downto 0) := (others => '0');  -- Q2: post REGEN (R3 sat)
   signal s_c3     : signed(15 downto 0) := (others => '0');  -- Q3: post QUANTIZE deadzone
   signal s_seq1   : unsigned(3 downto 0) := (others => '0'); -- true sequency, pipelined
   signal s_seq2   : unsigned(3 downto 0) := (others => '0');
@@ -264,7 +272,7 @@ begin
 
   -- ==========================================================================
   -- Q1 : capture forward coeff, apply runtime TILT (attenuate-only), scramble
-  --      the parameter index, and expose the tap for CROSSTALK / ADAPT.
+  --      the parameter index, and expose the Q1 tap (ADAPT; Y lane only).
   -- ==========================================================================
   p_q1 : process(clk)
     variable v_seq  : unsigned(3 downto 0);
@@ -280,12 +288,13 @@ begin
     end if;
   end process;
 
-  coef_tap <= s_c_tilt;   -- Q1 register out; stable while Q2 consumes it
+  coef_tap <= s_c_tilt;   -- Q1 register out; ADAPT tap (top consumes Y lane only)
 
   -- ==========================================================================
-  -- Q2 : REGEN vertical feedback add + CROSSTALK inject, R3 saturating clamp to
-  --      16b, store the resonant AC coefficient (reduced precision), and the
-  --      Spectral-Hold source select. DC (true seq 0) is excluded from feedback.
+  -- Q2 : REGEN vertical feedback add (2-input: TILT coeff + REGEN prev-line),
+  --      R3 saturating clamp to 16b, store the resonant AC coefficient (reduced
+  --      precision), and the Spectral-Hold source select. DC (true seq 0) is
+  --      excluded from feedback. (CROSSTALK inject removed — Gate-1 rework.)
   -- ==========================================================================
   p_q2 : process(clk)
     variable v_regen : signed(17 downto 0);
@@ -299,7 +308,7 @@ begin
       else
         v_regen := (others => '0');
       end if;
-      v_sum := resize(s_c_tilt, 18) + v_regen + resize(xtalk_in, 18);
+      v_sum := resize(s_c_tilt, 18) + v_regen;   -- 2-input add (no CROSSTALK term)
 
       if hold = '1' then
         -- Spectral Hold: replay the frozen (stored) coefficient into the inverse
@@ -446,25 +455,20 @@ architecture sequency of program_top is
   signal s_tilt_str : unsigned(1 downto 0) := (others => '0');
   signal s_regen_sh : unsigned(1 downto 0) := (others => '0');
   signal s_regen_en : std_logic := '0';
-  signal s_xt_en    : std_logic := '0';
-  signal s_xt_neg   : std_logic := '0';
-  signal s_xt_sh    : integer range 0 to 7 := 0;
+  signal s_xt_reserved : unsigned(9 downto 0) := (others => '0');  -- Knob 5 CROSSTALK: reserved/inert (read, unused)
   signal s_adapt_en : std_logic := '0';
   signal s_adapt_sh : integer range 0 to 15 := 0;
   signal s_pol      : std_logic := '0';       -- ADAPT polarity (tog 9)
   signal s_hold     : std_logic := '0';       -- Spectral Hold (tog 10)
-  signal s_chroma   : std_logic := '1';       -- Chroma too (tog 11)
+  signal s_chroma   : std_logic := '1';       -- Tog 11 Chroma: reserved/inert (read, unused)
   signal s_fader    : unsigned(9 downto 0) := (others => '0');
 
   -- ------- position counter (avid-anchored mod-16) ---------------------------
   signal s_pos    : unsigned(3 downto 0) := (others => '0');
   signal s_avid_q : std_logic := '0';
 
-  -- ------- CROSSTALK taps + injections (combinational seam, concurrent) ------
-  signal s_tap_y, s_tap_u, s_tap_v : signed(15 downto 0);
-  signal s_inj_y, s_inj_u, s_inj_v : signed(15 downto 0);
-  signal s_xt_fromy : signed(15 downto 0);   -- luma leak amount (y_tap >> sh)
-  signal s_xt_fromc : signed(15 downto 0);   -- chroma leak amount ((u+v)/2 >> sh)
+  -- ------- ADAPT tap (Y-lane Q1 coefficient; drives the shared deadzone) ------
+  signal s_tap_y : signed(15 downto 0);
 
   -- ------- ADAPT (shared, Y block-energy driven) -----------------------------
   signal s_en_acc  : unsigned(17 downto 0) := (others => '0');
@@ -521,8 +525,6 @@ begin
   p_ctrl : process(clk)
     variable v_td  : signed(10 downto 0);
     variable v_tm  : unsigned(9 downto 0);
-    variable v_xd  : signed(10 downto 0);
-    variable v_xm  : unsigned(9 downto 0);
     variable v_reg : unsigned(9 downto 0);
     variable v_adp : unsigned(9 downto 0);
   begin
@@ -552,17 +554,10 @@ begin
       if v_reg > 16 then s_regen_en <= '1'; else s_regen_en <= '0'; end if;
       s_regen_sh <= not v_reg(9 downto 8);      -- strong->00 (>>1) .. weak->11 (>>4)
 
-      -- CROSSTALK (knob 5): bipolar leakage; magnitude -> shift, sign -> direction
-      v_xd := signed('0' & registers_in(4)) - to_signed(512, 11);
-      s_xt_neg <= v_xd(10);
-      if v_xd(10) = '1' then v_xm := unsigned(resize(-v_xd, 10));
-      else                   v_xm := unsigned(resize(v_xd, 10)); end if;
-      if v_xm > 32 then s_xt_en <= '1'; else s_xt_en <= '0'; end if;
-      if    v_xm >= 384 then s_xt_sh <= 1;
-      elsif v_xm >= 256 then s_xt_sh <= 2;
-      elsif v_xm >= 128 then s_xt_sh <= 3;
-      else                   s_xt_sh <= 4;
-      end if;
+      -- CROSSTALK (knob 5): RESERVED / INERT. Dropped in the Gate-1 timing rework
+      -- (the cross-lane V-tap -> mix -> Y-lane Q2 3-input add crashed Fmax to 56.5
+      -- MHz). Read for forward-compat + to keep the 12-control map; NOT acted on.
+      s_xt_reserved <= unsigned(registers_in(4));
 
       -- ADAPT (knob 6): energy -> deadzone; bigger knob -> smaller shift -> bigger delta
       v_adp := unsigned(registers_in(5));
@@ -595,26 +590,6 @@ begin
       end if;
     end if;
   end process;
-
-  -- ==========================================================================
-  -- CROSSTALK seam (combinational): Y<->C leakage from the three Q1 taps.
-  --   chroma <- luma:  u,v += +/- (y_tap >> sh)
-  --   luma   <- chroma: y   += +/- ((u_tap+v_tap)/2 >> sh)
-  -- Aligned: taps are Q1 registers (stable while lanes compute Q2); the add is a
-  -- single combinational layer between the Q1 and Q2 registers (concurrent, no
-  -- process). All three injections are 0 when disabled (identity-safe).
-  -- ==========================================================================
-  s_xt_fromy <= shift_right(s_tap_y, s_xt_sh);
-  s_xt_fromc <= shift_right(
-                  resize(shift_right(resize(s_tap_u, 17) + resize(s_tap_v, 17), 1), 16),
-                  s_xt_sh);
-
-  s_inj_u <= (others => '0') when s_xt_en = '0' else
-             -s_xt_fromy      when s_xt_neg = '1' else  s_xt_fromy;
-  s_inj_v <= (others => '0') when s_xt_en = '0' else
-             -s_xt_fromy      when s_xt_neg = '1' else  s_xt_fromy;
-  s_inj_y <= (others => '0') when s_xt_en = '0' else
-             -s_xt_fromc      when s_xt_neg = '1' else  s_xt_fromc;
 
   -- ==========================================================================
   -- ADAPT (shared): accumulate |Y tap| across a 16-coeff block; latch at block
@@ -707,7 +682,7 @@ begin
               regen_sh => s_regen_sh, regen_en => s_regen_en,
               adapt_delta => s_adapt_d, hold => s_hold,
               regen_prev => s_prev_y, regen_cur => s_cur_y,
-              coef_tap => s_tap_y, xtalk_in => s_inj_y,
+              coef_tap => s_tap_y,
               d_in => data_in.y, d_out => s_org_y);
 
   u_u : entity work.wht_organ_lane
@@ -717,7 +692,7 @@ begin
               regen_sh => s_regen_sh, regen_en => s_regen_en,
               adapt_delta => s_adapt_d, hold => s_hold,
               regen_prev => s_prev_u, regen_cur => s_cur_u,
-              coef_tap => s_tap_u, xtalk_in => s_inj_u,
+              coef_tap => open,
               d_in => data_in.u, d_out => s_org_u);
 
   u_v : entity work.wht_organ_lane
@@ -727,7 +702,7 @@ begin
               regen_sh => s_regen_sh, regen_en => s_regen_en,
               adapt_delta => s_adapt_d, hold => s_hold,
               regen_prev => s_prev_v, regen_cur => s_cur_v,
-              coef_tap => s_tap_v, xtalk_in => s_inj_v,
+              coef_tap => open,
               d_in => data_in.v, d_out => s_org_v);
 
   -- ==========================================================================
@@ -750,10 +725,11 @@ begin
   s_dry_u <= s_rd_q2(23 downto 14);
   s_dry_v <= s_rd_q2(13 downto 4);
 
-  -- Chroma toggle: "Luma only" routes U/V wet input to the dry-delayed value so
-  -- the fader output is dry regardless (hook #11) with IDENTICAL latency.
-  s_wet_u <= unsigned(s_org_u) when s_chroma = '1' else unsigned(s_dry_u);
-  s_wet_v <= unsigned(s_org_v) when s_chroma = '1' else unsigned(s_dry_v);
+  -- Chroma toggle (Tog 11): RESERVED/INERT, fixed-on. Chroma ALWAYS flows through
+  -- the organ now (the "Luma only" bypass is retired); s_chroma is read but not
+  -- acted on. U/V wet = organ output unconditionally.
+  s_wet_u <= unsigned(s_org_u);
+  s_wet_v <= unsigned(s_org_v);
 
   -- ==========================================================================
   -- Dry/wet fader : interpolator_u per channel (principle #4). +4 clocks.

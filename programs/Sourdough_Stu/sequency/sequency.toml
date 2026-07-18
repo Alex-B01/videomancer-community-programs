@@ -6,8 +6,10 @@
 # all-formats declaration (block tiling self-calibrates from avid edges; no
 # framebuffer, no temporal state).  Musical knob scaling lives here
 # (control_mode / value_labels), not in fabric.
-# Full-chroma committed build: a wht_organ_lane runs on each of Y/U/V.  Knob 5
-# (Crosstalk) and Toggle 11 (Chroma) are ACTIVE.  Toggles 7/8 carry inert
+# Full-chroma build: a wht_organ_lane runs on each of Y/U/V (chroma always on).
+# Knob 5 (Crosstalk) and Toggle 11 (Chroma) are RESERVED/INERT (read, not acted
+# on) after the Gate-1 timing rework dropped the cross-lane CROSSTALK datapath;
+# both stay declared for forward-compat.  Toggles 7/8 likewise carry inert
 # retired-mode positions (v1 fabric is always Hard / XOR).
 
 [program]
@@ -19,7 +21,7 @@ author = "AB (Sourdough_Stu)"
 license = "GPL-3.0"
 categories = ["Signal", "Pattern", "Glitch"]
 program_type = "processing"
-description = "Full-chroma Walsh-Hadamard organ: Y/U/V spectral blocks played with quantize, tilt, scramble, regen, adapt, crosstalk."
+description = "Full-chroma Walsh-Hadamard organ: Y/U/V spectral blocks played with quantize, tilt, scramble, regen, and adapt."
 hardware_compatibility = ["rev_a", "rev_b"]
 core = "yuv444_30b"
 url = "https://github.com/lzxindustries/videomancer-community-programs"
@@ -68,8 +70,9 @@ initial_value = 0
 display_float_digits = 0
 suffix_label = "%"
 
-# Knob 5 (Crosstalk): ACTIVE in full-chroma.  Bipolar around 512 (center = no
-# leakage); one side leaks luma->chroma, the other inverts the coupling.
+# Knob 5 (Crosstalk): RESERVED / INERT (read, not acted on).  The cross-lane
+# CROSSTALK datapath was dropped in the Gate-1 timing rework; the control stays
+# declared (12-control map preserved) but the fabric ignores it.
 [[parameter]]
 parameter_id = "rotary_potentiometer_5"
 name_label = "Crosstalk"
@@ -119,8 +122,9 @@ name_label = "Spectral Hold"
 value_labels = ["Live", "Hold"]
 initial_value_label = "Live"
 
-# Toggle 11 (Chroma): ACTIVE.  "Chroma too" selects the x3 lane path (default);
-# "Luma only" leaves U/V as dry-delayed passthrough.
+# Toggle 11 (Chroma): RESERVED / INERT, fixed-on.  Chroma always flows through
+# the x3 lane path now; the "Luma only" bypass is retired.  Read but not acted
+# on; kept declared for forward-compat.
 [[parameter]]
 parameter_id = "toggle_switch_11"
 name_label = "Chroma"
