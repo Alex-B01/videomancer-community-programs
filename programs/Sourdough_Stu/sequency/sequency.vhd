@@ -188,7 +188,10 @@ architecture sequency of program_top is
         return resize(signed('0' & p), FW) - to_signed(512, FW);
     end function;
 
-    -- de-center (already >>4 normalized) + clamp to [0,1023] -> 10-bit
+    -- de-center (already >>4 normalized) + clamp to [0,1023] -> 10-bit.
+    -- In the else-branch t is in [0,1023]; take the low CW bits as an UNSIGNED
+    -- magnitude.  A signed resize(t, CW) here would fold bit 9 (the +512 place
+    -- becomes the 10-bit sign bit), collapsing every luma >= 512 to luma-512.
     function decen(c : signed) return std_logic_vector is
         variable t : signed(FW downto 0);
     begin
@@ -198,7 +201,7 @@ architecture sequency of program_top is
         elsif t > to_signed(1023, FW + 1) then
             return std_logic_vector(to_unsigned(1023, CW));
         else
-            return std_logic_vector(resize(t, CW));
+            return std_logic_vector(t(CW - 1 downto 0));  -- unsigned low bits, no sign fold
         end if;
     end function;
 
@@ -269,8 +272,10 @@ architecture sequency of program_top is
     -- ====================================================================
     signal s_cbuf_y_q : std_logic_vector(BW-1 downto 0);
     signal s_apx_d1   : unsigned(ABITS-1 downto 0) := (others => '0');
-    signal s_prev     : t_fwd;    -- prev-line coeffs being assembled (per phase)
-    signal s_prev_blk : t_fwd;    -- latched at block complete, consumed at M2
+    -- howler-style signal init (no resets on iCE40): defined-but-stale at
+    -- top-of-frame rather than X (matches the spec's <=1-line-stale caveat).
+    signal s_prev     : t_fwd := (others => (others => '0'));  -- prev-line coeffs assembled (per phase)
+    signal s_prev_blk : t_fwd := (others => (others => '0'));  -- latched at block complete, consumed at M2
 
     -- write-back serializer
     signal s_wb_bank : t_fwd;
