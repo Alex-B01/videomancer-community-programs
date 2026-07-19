@@ -1,0 +1,158 @@
+# Copyright (C) 2026 AB (Sourdough_Stu)
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# WITNESS (Program 8) -- program configuration.
+#
+# All-formats declaration: the timing-restriction key is intentionally omitted;
+# its absence means every video timing is supported (CI asserts it stays absent).
+# Div-1 full clock: the HD clock-divisor key is intentionally omitted (defaults to 1).
+# Musical scaling lives here (control_mode / value_labels) -> zero fabric on knob
+# response; the fabric receives the raw 10-bit register value.
+
+[program]
+program_id = "com.sourdoughstu.witness"
+program_name = "WITNESS"
+program_version = "1.0.0"
+abi_version = ">=1.0,<2.0"
+author = "AB (Sourdough_Stu)"
+license = "GPL-3.0"
+categories = ["Optics", "Vision", "Analysis", "Shape"]
+program_type = "processing"
+description = "Gaze tracker: image-moments centroid drives radial optics (iris, zone-plate rings, shear), orbiting stamps and a motion trail."
+hardware_compatibility = ["rev_a", "rev_b"]
+core = "yuv444_30b"
+url = "https://github.com/lzxindustries/videomancer-community-programs"
+
+# ---------------------------------------------------------------------------
+# Operating point (pots -> registers_in(0..5))
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_1"
+name_label = "IRIS"
+control_mode = "quart_out"      # fine near closed; open = no vignette
+min_value = 0
+max_value = 1023
+initial_value = 1023
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_2"
+name_label = "RINGS"
+control_mode = "quad_in"        # gentle onset; 0 = off (identity)
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_3"
+name_label = "LAG"
+control_mode = "quad_in"        # gaze inertia; rate-normalized in fabric
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_4"
+name_label = "PULL"
+control_mode = "linear"         # bipolar: 512 = no shear
+min_value = 0
+max_value = 1023
+initial_value = 512
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_5"
+name_label = "ORBIT"
+control_mode = "quad_in"        # stamp count + speed; 0 = no stamps
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+[[parameter]]
+parameter_id = "rotary_potentiometer_6"
+name_label = "EDGE"
+control_mode = "linear"         # iris falloff: hard <-> soft
+min_value = 0
+max_value = 1023
+initial_value = 512
+
+# ---------------------------------------------------------------------------
+# Behaviours (toggles -> registers_in(6) bits 0..4)
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "toggle_switch_7"
+name_label = "Track"
+value_labels = ["Brightness", "Motion"]
+initial_value_label = "Brightness"
+
+[[parameter]]
+parameter_id = "toggle_switch_8"
+name_label = "Evade"
+value_labels = ["Track", "Evade"]
+initial_value_label = "Track"
+
+[[parameter]]
+parameter_id = "toggle_switch_9"
+name_label = "Ellipse"
+value_labels = ["Off", "Fit"]
+initial_value_label = "Off"
+
+[[parameter]]
+parameter_id = "toggle_switch_10"
+name_label = "Stamp Set"
+value_labels = ["Set A", "Set B"]
+initial_value_label = "Set A"
+
+[[parameter]]
+parameter_id = "toggle_switch_11"
+name_label = "Trail"
+value_labels = ["Off", "Trail"]
+initial_value_label = "Off"
+
+# ---------------------------------------------------------------------------
+# Master dry/wet (fader -> registers_in(7))
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+parameter_id = "linear_potentiometer_12"
+name_label = "Dry / Wet"
+control_mode = "linear"
+min_value = 0
+max_value = 1023
+initial_value = 0
+
+# ---------------------------------------------------------------------------
+# Factory presets
+# ---------------------------------------------------------------------------
+
+[[preset]]
+name = "Clean"
+rotary_potentiometer_1 = 1023
+rotary_potentiometer_2 = 0
+rotary_potentiometer_3 = 0
+rotary_potentiometer_4 = 512
+rotary_potentiometer_5 = 0
+rotary_potentiometer_6 = 512
+linear_potentiometer_12 = 0
+
+[[preset]]
+name = "Soft Gaze"
+rotary_potentiometer_1 = 620
+rotary_potentiometer_3 = 700
+rotary_potentiometer_6 = 800
+linear_potentiometer_12 = 900
+
+[[preset]]
+name = "Zone Plate"
+rotary_potentiometer_1 = 800
+rotary_potentiometer_2 = 760
+rotary_potentiometer_3 = 500
+linear_potentiometer_12 = 1023
+
+[[preset]]
+name = "Orbit Witness"
+rotary_potentiometer_3 = 640
+rotary_potentiometer_5 = 820
+toggle_switch_9 = 1
+toggle_switch_11 = 1
+linear_potentiometer_12 = 900
