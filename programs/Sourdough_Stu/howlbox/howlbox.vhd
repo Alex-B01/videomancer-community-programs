@@ -24,26 +24,31 @@
 --   HOWLBOX is the Phase-1 multiplier/LC-discipline validator: EXACTLY 4 runtime
 --   multiplies (M1..M4), everything else shift / LUT / compare.
 --
--- Pipeline (16 processing + 4 interpolator = 20 clocks; divisible by 4):
---   S0  Input latch + sample NCO phase / STARVE-sag / body accumulators
---   S1  OP-node coupling: node_E, node_S from knobs + lags (adds/shifts)
---   S2  AC/DC condition + peaking HF (3-tap horizontal LPF, shift-add)
---   S3  Peaking product ............................ MULT M1  (node_E times hf)
---   S4  Peaking sum -> IIR input  x = clamp(base + p1 >> kP)   (R3)
---   S5  IIR taps ................................... MULT M2 (a1 times y[n-1]),
+-- Pipeline (20 processing + 4 interpolator = 24 clocks; divisible by 4):
+--   S0   Input latch + sample NCO phase / STARVE-sag / body accumulators
+--   S1   OP-node coupling: node_E, node_S from knobs + lags (adds/shifts)
+--   S2   AC/DC condition + peaking HF (3-tap horizontal LPF, shift-add)
+--   S3   Peaking product ........................... MULT M1  (node_E times hf)
+--   S4   Peaking sum -> IIR input  x = clamp(base + p1 >> kP)   (R3)
+--   S5   IIR taps .................................. MULT M2 (a1 times y[n-1]),
 --                                                    MULT M3 (a2 times y[n-2])
---   S6  IIR combine (recursion close), freeze-during-blanking (R7), r<1
---   S7  Rupture: comparator vs node_S-collapsed threshold, invert/fold (0 mult)
---   S8  NCO sine: quarter-wave LUT + quadrant reflection (registered)
---   S9  Chroma leak product ........................ MULT M4 (depth times sine)
---   S10 Remap write (avid-gated) + sync-stress read offset (shift/LUT, 0 mult)
---   S11 Remap read  (256x30 delay line, 1-clk BRAM latency)
---   S12 Remap register (R6 addr bounded to [0,255])
---   S13 Recombine Y/U/V
---   S14 Balance (Fmax / div-4 justification)
---   S15 R1 clamp -> wet (y in [64,940], u/v in [64,960])
---   B   Dry/wet interpolator_u (Y,U,V) with t = fader, dry delay-matched  (+4)
---   Total data_in -> data_out latency = 20.
+--   S6   IIR combine (recursion close), freeze-during-blanking (R7), r<1
+--   S7   Rupture: comparator vs node_S-collapsed threshold, invert/fold (0 mult)
+--   S8   NCO sine: quarter-wave LUT + quadrant reflection (registered)
+--   S9   Chroma leak product ....................... MULT M4 (depth times sine)
+--   S10a Remap write (avid-gated) + isolate variable barrel shift (disp_raw)
+--   S10b Displacement arithmetic (add amp, width-class, clamp)  [S10 3-split
+--   S10c Read-addr subtract (wr_ptr - MIN_LAG - disp), mod 256  for HD Fmax; R6]
+--   S11  Remap read  (256x30 delay line, 1-clk BRAM latency)
+--   S12  Remap register (R6 addr bounded to [0,255])
+--   S13  Recombine Y/U/V
+--   S14  Balance (Fmax / div-4 justification)
+--   S14b Balance   (re-pad to keep total latency divisible by 4)
+--   S14c Balance
+--   S15  R1 clamp -> wet (y in [64,940], u/v in [64,960])
+--   B    Dry/wet interpolator_u (Y,U,V) with t = fader, dry delay-matched  (+4)
+--   Total data_in -> data_out latency = 24 (was 20; S10 3-split + re-pad for
+--   HD timing closure -- no behaviour change, no feature cut; IIR loop untouched).
 --
 -- Resources / EBR map (physical, power-of-two):
 --   H-phase remap delay : 256 (2^8) x 30-bit, 1W + 1R -> 2 EBR
@@ -93,8 +98,8 @@ architecture howlbox of program_top is
   -- ======================================================================
   -- Constants
   -- ======================================================================
-  constant C_PROCESSING_DELAY_CLKS : integer := 16;         -- data_in -> wet (s_out)
-  constant C_SYNC_DELAY_CLKS       : integer := 20;         -- 16 + 4 (interpolator)
+  constant C_PROCESSING_DELAY_CLKS : integer := 20;         -- data_in -> wet (s_out)
+  constant C_SYNC_DELAY_CLKS       : integer := 24;         -- 20 + 4 (interpolator)
 
   constant C_REMAP_BITS  : integer := 8;                    -- 256-deep (2^8), R6
   constant C_REMAP_SIZE  : integer := 256;
@@ -232,7 +237,7 @@ architecture howlbox of program_top is
   signal s2_avid          : std_logic := '0';
   signal s2_phase         : unsigned(9 downto 0) := (others => '0');
   -- S3
-  signal s3_p1            : signed(25 downto 0) := (others => '0');   -- M1 product
+  signal s3_p1            : signed(13 downto 0) := (others => '0');   -- M1 product, pre-scaled >>kP
   signal s3_base          : signed(11 downto 0) := (others => '0');
   signal s3_u, s3_v       : signed(11 downto 0) := (others => '0');
   signal s3_avid          : std_logic := '0';
@@ -244,7 +249,7 @@ architecture howlbox of program_top is
   signal s4_phase         : unsigned(9 downto 0) := (others => '0');
   -- S5
   signal s5_x             : signed(12 downto 0) := (others => '0');
-  signal s5_t1, s5_t2     : signed(25 downto 0) := (others => '0');   -- M2, M3 products
+  signal s5_t1, s5_t2     : signed(11 downto 0) := (others => '0');   -- M2, M3 taps, pre-scaled >>kR (12-bit, values fit)
   signal s5_u, s5_v       : signed(11 downto 0) := (others => '0');
   signal s5_avid          : std_logic := '0';
   signal s5_phase         : unsigned(9 downto 0) := (others => '0');
@@ -266,20 +271,30 @@ architecture howlbox of program_top is
   signal s8_avid          : std_logic := '0';
   -- S9
   signal s9_y, s9_u, s9_v : signed(11 downto 0) := (others => '0');
-  signal s9_leak          : signed(25 downto 0) := (others => '0');   -- M4 product
+  signal s9_leak          : signed(12 downto 0) := (others => '0');   -- M4 product, pre-scaled >>kLeak
   signal s9_avid          : std_logic := '0';
-  -- S10 (write data + addresses)
+  -- S10a (write data + write pointer + isolated barrel shift)
   signal s10_y, s10_u, s10_v : signed(11 downto 0) := (others => '0');
   signal s10_avid            : std_logic := '0';
   signal s_wr_ptr            : unsigned(C_REMAP_BITS - 1 downto 0) := (others => '0');
   signal s10_wr_addr         : unsigned(C_REMAP_BITS - 1 downto 0) := (others => '0');
+  signal s10a_disp_raw       : unsigned(10 downto 0) := (others => '0');  -- s9_y >> v_sh (barrel)
+  signal s10a_amp            : unsigned(5 downto 0)  := (others => '0');  -- (1023-node_s) >> k
+  signal s10a_rdbase         : unsigned(C_REMAP_BITS - 1 downto 0) := (others => '0');
+  signal s10a_is_sd          : std_logic := '0';               -- active width < 1024
+  -- S10b (displacement arithmetic)
+  signal s10b_disp           : unsigned(7 downto 0) := (others => '0');
+  signal s10b_rdbase         : unsigned(C_REMAP_BITS - 1 downto 0) := (others => '0');
+  -- S10c (read-address subtract)
   signal s_rd_addr           : unsigned(C_REMAP_BITS - 1 downto 0) := (others => '0');
   -- S11/S12 (BRAM read)
   signal s_rd_data       : std_logic_vector(C_REMAP_WIDTH - 1 downto 0) := (others => '0');
   signal s12_rd          : std_logic_vector(C_REMAP_WIDTH - 1 downto 0) := (others => '0');
-  -- S13/S14
-  signal s13_y, s13_u, s13_v : unsigned(9 downto 0) := (others => '0');
-  signal s14_y, s14_u, s14_v : unsigned(9 downto 0) := (others => '0');
+  -- S13/S14 + re-pad balance stages S14b/S14c
+  signal s13_y, s13_u, s13_v    : unsigned(9 downto 0) := (others => '0');
+  signal s14_y, s14_u, s14_v    : unsigned(9 downto 0) := (others => '0');
+  signal s14b_y, s14b_u, s14b_v : unsigned(9 downto 0) := (others => '0');
+  signal s14c_y, s14c_u, s14c_v : unsigned(9 downto 0) := (others => '0');
   -- S15 wet output
   signal s_out_y, s_out_u, s_out_v : unsigned(9 downto 0) := (others => '0');
 
@@ -604,11 +619,11 @@ begin
   -- S3: Peaking product ............................ MULT M1
   -- ======================================================================
   p_s3 : process (clk)
-    variable v_ne : signed(12 downto 0);
+    variable v_ne : signed(10 downto 0);
   begin
     if rising_edge(clk) then
-      v_ne     := resize(signed('0' & std_logic_vector(s_node_e)), 13);
-      s3_p1    <= v_ne * s2_hf;                                    -- MULT M1
+      v_ne     := resize(signed('0' & std_logic_vector(s_node_e)), 11);   -- 11-bit (value fits)
+      s3_p1    <= resize(shift_right(v_ne * resize(s2_hf, 11), C_KP), 14); -- MULT M1 (11x11, pre-scaled >>kP)
       s3_base  <= s2_base;
       s3_u     <= s2_u;
       s3_v     <= s2_v;
@@ -624,7 +639,7 @@ begin
     variable v_sum : signed(13 downto 0);
   begin
     if rising_edge(clk) then
-      v_sum    := resize(s3_base, 14) + resize(shift_right(s3_p1, C_KP), 14);
+      v_sum    := resize(s3_base, 14) + resize(s3_p1, 14);       -- p1 pre-scaled at S3
       s4_x     <= resize(fn_clamp_band(v_sum, 0, 1023), 13);      -- keep [0,1023]
       s4_u     <= s3_u;
       s4_v     <= s3_v;
@@ -638,14 +653,17 @@ begin
   --   y[n-1] = s6_y (last output), y[n-2] = s6_y_d1.
   -- ======================================================================
   p_s5 : process (clk)
-    variable v_a1 : signed(12 downto 0);
-    variable v_a2 : signed(12 downto 0);
+    variable v_a1 : signed(10 downto 0);
+    variable v_a2 : signed(10 downto 0);
   begin
     if rising_edge(clk) then
-      v_a1     := resize(signed('0' & std_logic_vector(s_a1)), 13);
-      v_a2     := resize(signed('0' & std_logic_vector(s_a2)), 13);
-      s5_t1    <= v_a1 * s6_y;                                    -- MULT M2
-      s5_t2    <= v_a2 * s6_y_d1;                                 -- MULT M3
+      -- 11-bit operands (values fit -> bit-identical), 11x11 multiplies.
+      v_a1     := resize(signed('0' & std_logic_vector(s_a1)), 11);
+      v_a2     := resize(signed('0' & std_logic_vector(s_a2)), 11);
+      -- Pre-scale (>>kR); 11x11 multiplies. The subtract stays in S6 -- the
+      -- multiply must own its stage (folding the subtract here regresses Fmax).
+      s5_t1    <= resize(shift_right(v_a1 * resize(s6_y, 11), C_KR), 12);      -- MULT M2
+      s5_t2    <= resize(shift_right(v_a2 * resize(s6_y_d1, 11), C_KR), 12);   -- MULT M3
       s5_x     <= s4_x;
       s5_u     <= s4_u;
       s5_v     <= s4_v;
@@ -657,6 +675,9 @@ begin
   -- ======================================================================
   -- S6: IIR combine (recursion close). r<1 + freeze-during-blanking (R7):
   --   during blanking the input is forced to 0 so the loop DECAYS to zero.
+  --   Taps are pre-scaled (>>kR) at S5 to 12-bit, so the in-loop subtract is
+  --   12-bit not 26-bit -- pure width narrowing, loop latency/pole/tap-spacing
+  --   unchanged (sub-LSB rounding only; NO register added inside the loop).
   -- ======================================================================
   p_s6 : process (clk)
     variable v_fb : signed(13 downto 0);
@@ -664,7 +685,7 @@ begin
     variable v_y  : signed(13 downto 0);
   begin
     if rising_edge(clk) then
-      v_fb := resize(shift_right(s5_t1 - s5_t2, C_KR), 14);
+      v_fb := resize(s5_t1 - s5_t2, 14);   -- 12-bit in-loop subtract
       if s_ring_under = '1' then           -- tog8 overshoot / undershoot polarity
         v_fb := -v_fb;
       end if;
@@ -730,11 +751,11 @@ begin
   --   Carry raw luma/chroma; the leak is routed and applied at S10.
   -- ======================================================================
   p_s9 : process (clk)
-    variable v_depth : signed(12 downto 0);
+    variable v_depth : signed(10 downto 0);
   begin
     if rising_edge(clk) then
-      v_depth := resize(signed('0' & std_logic_vector(s_rainbow_depth)), 13);
-      s9_leak <= v_depth * s8_sine;                              -- MULT M4
+      v_depth := resize(signed('0' & std_logic_vector(s_rainbow_depth)), 11);   -- 11-bit (value fits)
+      s9_leak <= resize(shift_right(v_depth * resize(s8_sine, 11), C_KLEAK), 13);  -- MULT M4 (11x11, pre-scaled >>kLeak)
       s9_y    <= resize(s8_y, 12);
       s9_u    <= s8_u;
       s9_v    <= s8_v;
@@ -743,20 +764,19 @@ begin
   end process p_s9;
 
   -- ======================================================================
-  -- S10: apply chroma leak (route by tog9) + write pointer + sync-stress read
-  --   offset (0 mult, R6). displacement grows with SYNC STRESS and content
-  --   brightness, amplified as node_S falls; 0 at zero stress (resting lag ~
-  --   no shift). Width-class keeps the shift proportional across formats.
+  -- S10 read-address math is split across 3 stages (S10a/b/c) so no single
+  -- clock carries the full ~23-level cone (subtract -> barrel shift -> add ->
+  -- compare-muxes -> two subtract carry-chains) -- the sole sub-76 MHz path.
+  -- 0 mult, R6. displacement grows with SYNC STRESS + content brightness,
+  -- amplified as node_S falls; 0 at zero stress (resting lag ~ no shift).
   -- ======================================================================
-  p_s10 : process (clk)
+  -- S10a: chroma leak (route by tog9) + write pointer; isolate the barrel shift.
+  p_s10a : process (clk)
     variable v_leak : signed(12 downto 0);
     variable v_sh   : integer;
-    variable v_disp : integer;
-    variable v_amp  : integer;
-    variable v_addr : integer;
   begin
     if rising_edge(clk) then
-      v_leak := resize(shift_right(s9_leak, C_KLEAK), 13);
+      v_leak := resize(s9_leak, 13);       -- leak pre-scaled at S9
       s10_y  <= s9_y;
       if s_rainbow_v = '1' then            -- tog9: V leak
         s10_u <= s9_u;
@@ -767,6 +787,7 @@ begin
       end if;
       s10_avid    <= s9_avid;
       s10_wr_addr <= s_wr_ptr;
+      s10a_rdbase <= s_wr_ptr;             -- snapshot this pixel's read base
       if s9_avid = '1' then
         s_wr_ptr <= s_wr_ptr + 1;          -- free-running rolling window
       end if;
@@ -778,26 +799,44 @@ begin
       elsif v_sh > C_DISP_SHIFTMAX then
         v_sh := C_DISP_SHIFTMAX;
       end if;
-      v_disp := to_integer(shift_right(unsigned(std_logic_vector(s9_y(9 downto 0))), v_sh));
-
+      s10a_disp_raw <= resize(shift_right(
+                         unsigned(std_logic_vector(s9_y(9 downto 0))), v_sh), 11);
       -- amplified as the supply falls (a starving supply cannot hold H-timing)
-      v_amp  := to_integer(shift_right(to_unsigned(1023, 11) - resize(s_node_s, 11),
-                                       C_K_SYNCAMP));
-      v_disp := v_disp + v_amp;
-
-      -- width-class scale (compare-selected shift keeps the shift proportional)
+      s10a_amp <= resize(shift_right(to_unsigned(1023, 11) - resize(s_node_s, 11),
+                                     C_K_SYNCAMP), 6);
       if s_active_width_reg < to_unsigned(1024, 12) then
-        v_disp := v_disp / 2;
+        s10a_is_sd <= '1';
+      else
+        s10a_is_sd <= '0';
+      end if;
+    end if;
+  end process p_s10a;
+
+  -- S10b: displacement arithmetic (add amp, width-class scale, clamp).
+  p_s10b : process (clk)
+    variable v_disp : unsigned(11 downto 0);
+  begin
+    if rising_edge(clk) then
+      v_disp := resize(s10a_disp_raw, 12) + resize(s10a_amp, 12);
+      if s10a_is_sd = '1' then             -- width-class keeps shift proportional
+        v_disp := shift_right(v_disp, 1);
       end if;
       if v_disp > C_MAX_DISP then
-        v_disp := C_MAX_DISP;
+        v_disp := to_unsigned(C_MAX_DISP, 12);
       end if;
-
-      -- read address, wrapped to [0,255] (low 8 bits = mod 256)   R6
-      v_addr    := to_integer(s_wr_ptr) - C_MIN_LAG - v_disp;
-      s_rd_addr <= unsigned(to_signed(v_addr, 16)(C_REMAP_BITS - 1 downto 0));
+      s10b_disp   <= resize(v_disp, 8);
+      s10b_rdbase <= s10a_rdbase;
     end if;
-  end process p_s10;
+  end process p_s10b;
+
+  -- S10c: final read-address subtract. 8-bit modular arithmetic => result
+  -- inherently in [0,255] (R6), no wide integer carry chain.
+  p_s10c : process (clk)
+  begin
+    if rising_edge(clk) then
+      s_rd_addr <= s10b_rdbase - to_unsigned(C_MIN_LAG, C_REMAP_BITS) - s10b_disp;
+    end if;
+  end process p_s10c;
 
   -- ======================================================================
   -- Remap BRAM write (avid-gated). Separate process, no init on array.
@@ -859,33 +898,55 @@ begin
   end process p_s14;
 
   -- ======================================================================
+  -- S14b / S14c: re-pad balance stages (keep total latency divisible by 4
+  -- after the S10 3-split). Pure delay -- no arithmetic, outside the IIR loop.
+  -- ======================================================================
+  p_s14b : process (clk)
+  begin
+    if rising_edge(clk) then
+      s14b_y <= s14_y;
+      s14b_u <= s14_u;
+      s14b_v <= s14_v;
+    end if;
+  end process p_s14b;
+
+  p_s14c : process (clk)
+  begin
+    if rising_edge(clk) then
+      s14c_y <= s14b_y;
+      s14c_u <= s14b_u;
+      s14c_v <= s14b_v;
+    end if;
+  end process p_s14c;
+
+  -- ======================================================================
   -- S15: R1 clamp -> wet (broadcast-safe range)
   -- ======================================================================
   p_s15 : process (clk)
   begin
     if rising_edge(clk) then
-      if s14_y < C_Y_MIN then
+      if s14c_y < C_Y_MIN then
         s_out_y <= to_unsigned(C_Y_MIN, 10);
-      elsif s14_y > C_Y_MAX then
+      elsif s14c_y > C_Y_MAX then
         s_out_y <= to_unsigned(C_Y_MAX, 10);
       else
-        s_out_y <= s14_y;
+        s_out_y <= s14c_y;
       end if;
 
-      if s14_u < C_C_MIN then
+      if s14c_u < C_C_MIN then
         s_out_u <= to_unsigned(C_C_MIN, 10);
-      elsif s14_u > C_C_MAX then
+      elsif s14c_u > C_C_MAX then
         s_out_u <= to_unsigned(C_C_MAX, 10);
       else
-        s_out_u <= s14_u;
+        s_out_u <= s14c_u;
       end if;
 
-      if s14_v < C_C_MIN then
+      if s14c_v < C_C_MIN then
         s_out_v <= to_unsigned(C_C_MIN, 10);
-      elsif s14_v > C_C_MAX then
+      elsif s14c_v > C_C_MAX then
         s_out_v <= to_unsigned(C_C_MAX, 10);
       else
-        s_out_v <= s14_v;
+        s_out_v <= s14c_v;
       end if;
     end if;
   end process p_s15;
