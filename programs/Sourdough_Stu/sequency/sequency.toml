@@ -8,10 +8,13 @@
 # (control_mode / value_labels), not in fabric.
 # Y-only build: one wht_organ_lane runs on Y; U/V are PASSTHROUGH (delay-matched
 # to the Y organ+fader latency).  The full-chroma 3-lane build was congestion-
-# bound on HD timing; reverted to the proven Y-only scope.  Knob 5 (Crosstalk)
-# and Toggle 11 (Chroma) are RESERVED/INERT (read, not acted on -- chroma is
-# passthrough, no cross-lane datapath); both stay declared for forward-compat.
-# Toggles 7/8 likewise carry inert retired-mode positions (v1 = always Hard / XOR).
+# bound on HD timing; reverted to the proven Y-only scope.
+# REV-F (v1.0 completion) makes all four formerly-dead controls LIVE: Knob 5
+# (Crosstalk = output-stage Y->C effect-residual leak, opposite-signed into U/V),
+# Toggle 11 (Chroma = leak hard-off master, default "Luma only"), Toggle 7
+# (Dithered = LFSR dither at the QUANTIZE deadzone edge) and Toggle 8 (Rotate =
+# barrel-rotate coeff index).  No parameter shapes change vs the declared REV-E
+# map -- only the wiring and these comments.
 
 [program]
 program_id = "com.sourdoughstu.sequency"
@@ -71,13 +74,14 @@ initial_value = 0
 display_float_digits = 0
 suffix_label = "%"
 
-# Knob 5 (Crosstalk): RESERVED / INERT (read, not acted on).  The cross-lane
-# CROSSTALK datapath was dropped in the Gate-1 timing rework; the control stays
-# declared (12-control map preserved) but the fabric ignores it.
+# Knob 5 (Crosstalk): LIVE -- bipolar control for the output-stage Y->C effect-
+# residual leak.  Center 512 = OFF (center detent); the knob's side selects the
+# opposite-signed U/V polarity, and |distance| top-3-bits set the leak strength as
+# a barrel-shift amount (no runtime multiply).  Gated by Toggle 11 (master).
 [[parameter]]
 parameter_id = "rotary_potentiometer_5"
 name_label = "Crosstalk"
-control_mode = "linear"           # bipolar, 512 = no leakage
+control_mode = "linear"           # bipolar, 512 = OFF (no leak)
 display_min_value = -100
 display_max_value = 100
 initial_value = 512
@@ -95,8 +99,10 @@ display_float_digits = 0
 suffix_label = "%"
 
 # ---------------------------------------------------------------------------
-# Toggles.  Tog7/Tog8 are v1 single-state: the retired-mode position is read
-# but INERT (fabric always does Hard / XOR).  Labels kept for forward-compat.
+# Toggles.  Tog7 (Hard/Dithered) and Tog8 (XOR/Rotate) are LIVE (REV-F):
+# Dithered adds threshold-scaled LFSR dither at the QUANTIZE deadzone edge (DC
+# preserved; Hard is bit-exact); Rotate barrel-rotates the coeff index (0->0
+# keeps DC) as an alternative to XOR.
 # ---------------------------------------------------------------------------
 
 [[parameter]]
@@ -123,14 +129,16 @@ name_label = "Spectral Hold"
 value_labels = ["Live", "Hold"]
 initial_value_label = "Live"
 
-# Toggle 11 (Chroma): RESERVED / INERT, fixed-on.  Chroma always flows through
-# the x3 lane path now; the "Luma only" bypass is retired.  Read but not acted
-# on; kept declared for forward-compat.
+# Toggle 11 (Chroma): LIVE -- hard-off master enable for the Crosstalk leak.
+# "Luma only" forces the leak OFF regardless of Knob 5 (a performance guarantee a
+# center detent can't give); "Chroma too" arms it.  Default "Luma only" -> the
+# leak is off at load (chroma clean); the label stays honest (chroma IS affected
+# by the bleed when armed).
 [[parameter]]
 parameter_id = "toggle_switch_11"
 name_label = "Chroma"
 value_labels = ["Luma only", "Chroma too"]
-initial_value_label = "Chroma too"
+initial_value_label = "Luma only"
 
 # ---------------------------------------------------------------------------
 # Fader
@@ -164,7 +172,7 @@ toggle_switch_7 = 0
 toggle_switch_8 = 0
 toggle_switch_9 = 0
 toggle_switch_10 = 0
-toggle_switch_11 = 1
+toggle_switch_11 = 0
 linear_potentiometer_12 = 0
 
 [[preset]]
@@ -186,4 +194,5 @@ name = "Chroma Bleed"
 rotary_potentiometer_1 = 300
 rotary_potentiometer_5 = 820
 rotary_potentiometer_2 = 640
+toggle_switch_11 = 1          # arm the leak master (default is "Luma only" = off)
 linear_potentiometer_12 = 1000

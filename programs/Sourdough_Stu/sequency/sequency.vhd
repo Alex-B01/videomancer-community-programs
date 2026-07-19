@@ -6,7 +6,7 @@
 -- https://github.com/lzxindustries/videomancer-community-programs
 --
 -- Program Name:
---   Sequency  (Y-ONLY, R2SDF streaming WHT — committed build)
+--   Sequency  (Y-ONLY, R2SDF streaming WHT — REV-F v1.0 completion, latency 56)
 --
 -- Author:
 --   AB (Sourdough_Stu)
@@ -26,17 +26,29 @@
 --   No framebuffer, no temporal state -> natively all-formats. Block index =
 --   avid-anchored mod-16 counter (720/1280/1920 all divide by 16 exactly).
 --
---   Y-ONLY committed topology: a single wht_organ_lane on Y with the FULL
---   feature set (QUANTIZE/TILT/SCRAMBLE/REGEN/ADAPT + dry/wet fader). U and V
---   are PASSTHROUGH, delay-matched to the Y organ+fader latency (52) via the
---   shared BRAM circular delay + the +4 interpolator-alignment tail (the
---   sequency_sdf reference-prototype pattern). The U/V organ lanes and the
---   packed U/V REGEN coefficient buffer are REMOVED. Shared control-derive
---   (TILT strength/dir, SCRAMBLE key, ADAPT threshold, and the precomputed
---   QUANTIZE deadzone thresholds q_th0..3) lives in the top and drives the one
---   Y lane. Knob 5 (CROSSTALK) and Toggle 11 (Chroma) are RESERVED/INERT (read,
---   not acted on): chroma is passthrough, there is no cross-lane datapath. All
---   12 controls stay declared.
+--   Y-ONLY topology: a single wht_organ_lane on Y with the FULL feature set
+--   (QUANTIZE/TILT/SCRAMBLE/REGEN/ADAPT + dry/wet fader). U and V are PASSTHROUGH,
+--   delay-matched to the Y organ+fader latency via the shared BRAM circular delay
+--   + a fixed interpolator/leak alignment tail. The U/V organ lanes and the packed
+--   U/V REGEN coefficient buffer are REMOVED. Shared control-derive (TILT
+--   strength/dir, SCRAMBLE key, ADAPT threshold, and the precomputed QUANTIZE
+--   deadzone thresholds q_th0..3) lives in the top and drives the one Y lane.
+--
+--   REV-F (v1.0 completion pass) — the four formerly-dead controls are now LIVE:
+--     Knob 5  CROSSTALK : output-stage Y->C effect-residual leak. Injects
+--                         k*(Y_out - Y_dry) into U/V, OPPOSITE-signed (NTSC
+--                         cross-color shimmer, sync_bleed S6 precedent). Bipolar,
+--                         center 512 = OFF; k = top-3-bits-of-|distance| -> BARREL
+--                         SHIFT (no multiply); polarity from the knob's side.
+--     Tog 11  CHROMA    : hard-off master enable for the leak ("Luma only" = off /
+--                         "Chroma too" = on). Default = "Luma only" (leak off at load).
+--     Tog 7   DITHERED  : threshold-scaled free-running-LFSR dither on the QUANTIZE
+--                         deadzone-edge compare (DC exempt; Hard = bit-exact REV-E).
+--     Tog 8   ROTATE    : 4-bit barrel-rotate of the coefficient index (alt to XOR;
+--                         index 0 -> 0 keeps DC home). All 12 controls now functional.
+--   Load-neutral: the residual is identically 0 at fader-dry OR effect-neutral, so
+--   U/V stay bit-exact regardless of Knob 5 position. The leak is single-lane FF +
+--   combinational (NOT the deferred chroma organ) and adds ZERO memory.
 --
 --   Scope note: the full-4:4:4-chroma build (3x wht_organ_lane) was congestion-
 --   bound (~88% fill, Fmax stuck at 56.5->62.9->66.1 MHz across 3 timing
@@ -50,25 +62,36 @@
 --     F2  forward SDF D=4  (W=13) ........................ 5  (cum 15)
 --     F3  forward SDF D=2  (W=14) ........................ 3  (cum 18)
 --     F4  forward SDF D=1  (W=15) -> coeff stream ........ 2  (cum 20)
---     Q1  capture + TILT(atten) + SCRAMBLE-idx + ADAPT tap 1  (cum 21)
+--     Q1  capture + TILT(atten) + SCRAMBLE-idx (XOR/Rot) +
+--         ADAPT tap ...................................... 1  (cum 21)
 --     Q2a REGEN BRAM-read isolation: register ram_y read +
 --         pre-shift/gate feedback term (Gate-1 timing fix)  1  (cum 22)
 --     Q2b REGEN add (TILT+REGEN, 2-input) + R3 sat + store  1  (cum 23)
 --     Q3  QUANTIZE deadzone: band-select precomputed thr
---         (q_th0..3) + magnitude compare, DC exempt ...... 1  (cum 24)
+--         (q_th0..3) + magnitude compare, DC exempt,
+--         + optional threshold-scaled LFSR dither (Tog 7)  1  (cum 24)
 --     I1  inverse SDF D=1  (W=17, widened +1) ............ 2  (cum 26)
 --     I2  inverse SDF D=2  (W=18) ........................ 3  (cum 29)
 --     I3  inverse SDF D=4  (W=19) ........................ 5  (cum 34)
 --     I4  inverse SDF D=8  (W=20) -> reconstructed x16 ... 9  (cum 43)
 --     S   +8 round, >>4 normalize, R1 broadcast clamp .... 2  (cum 45)
 --     P   /4 sync-discipline pad (pure delay) ............ 3  (cum 48)
---   Dry/wet fader (interpolator_u, Y only) ............... 4  -> total 52
+--   Dry/wet fader (interpolator_u, Y only) -> Y_out ...... 4  (cum 52)
+--   REV-F Y->C residual leak (U/V path):
+--     L1  residual = Y_out - Y_dry(52), master-gated ..... 1  (cum 53)
+--     L2  k barrel-shift (top-3 knob bits; NO multiply) .. 1  (cum 54)
+--     L3  opposite-signed inject (U +=/-= , V mirror) .... 1  (cum 55)
+--     L4  R1 clamp [64,960] -> broadcast-safe U/V ........ 1  (cum 56)
+--   Faded-Y +4 pure-delay pipe (52 -> 56, realign w/ leak) 4  -> total 56
 --   => C_PROCESSING_DELAY_CLKS = 48 (lane core incl. Q2a + /4 pad),
---      C_SYNC_DELAY_CLKS = 52 (= 48+4, the interpolator tail; howler discipline).
+--      C_SYNC_DELAY_CLKS = 56 (= 48 + interpolator 4 + leak retime 4; all /4).
 --      Sync + dry-Y + U/V passthrough ride the BRAM circular delay (48); dry-Y
---      feeds the Y fader (-> 52) and U/V + sync ride a shared +4 tail so every
---      data_out port is aligned at 52, FIXED and independent of every
---      knob/toggle/fader (R5/R8).
+--      feeds the Y fader (-> 52), and the full passthrough word (dryY/U/V/sync)
+--      rides a fixed +4 tail to 52 then the 4-clock leak stage to 56, while the
+--      faded Y is +4-padded to 56 — every data_out port aligned at 56, FIXED and
+--      independent of every knob/toggle/fader (R5/R8). The leak is post-fader,
+--      top-level, so the organ core stays 48 (untouched). The 64-deep BRAM delay
+--      (3 EBR) covers latency 56 with margin 8 -> no EBR change from the retime.
 --      GATE-1 TIMING FIX (this build): the pre-fix organ was 44 (end-to-end 48)
 --      but Fmax stuck at 70.97 < 76 on the INTRINSIC REGEN Q2 store path (ram_y
 --      BRAM read -> 18b add -> R3 double-saturate -> reg, one clock). Q2 is now
@@ -87,7 +110,11 @@
 --   The packed U+V REGEN buffer (8 EBR) is REMOVED with the U/V lanes. The
 --   delay stays 3 EBR (not the reference prototype's 2) because it also carries
 --   the Y fader's dry tap (dryY 10b) alongside U/V+sync (34b > 32b -> 3 EBR);
---   sequency_sdf had no fader so its delay was 24b/2 EBR. 9 << 20 budget.
+--   sequency_sdf had no fader so its delay was 24b/2 EBR. 9 << 14 budget.
+--   REV-F adds ZERO memory: the Crosstalk leak, the dither LFSR, and the barrel-
+--   rotate are all FF + combinational; the leak's Y_dry reference is the dryY
+--   already carried in the 34-bit delay word (no new port). The 64-deep delay
+--   still covers latency 56 (margin 8) -> EBR unchanged at 9.
 --
 -- LC estimate (honest, paper): Y-only single wht_organ_lane (measured 1-lane
 --   R2SDF skeleton ~1,500 LC + levered feature deltas ~1,700 for
@@ -117,22 +144,32 @@
 --   1): 3,782 LC (49%) / 9 EBR / Fmax 89.85 MHz (+13.85 over the 76 gate) —
 --   comfortable clearance, as predicted at ~48% fill; the REGEN store is no
 --   longer the wall. The shared-threshold hoist (s_q_th -> q_th0..3) is KEPT.
---   Latency 52 (/4).
+--   REV-F COMPLETION DELTA: four now-live controls add small serial add/sub/shift
+--   + a 13-bit LFSR + the leak/Y-pad register banks (4 leak stages carrying
+--   U/V/sync + 4 Y-delay + a widened 34b tail) + a dithered-threshold register bank
+--   at the top. No new structural class, no memory, zero runtime multiply (k is a
+--   barrel shift). RE-SMOKE (hd_hdmi, seed 1): 4,250 LC (55%) / 9 EBR / Fmax 87.54
+--   MHz (-2.31 vs the REV-E 89.85; critical path = the SDK interpolator multiply,
+--   NOT the leak). LC is +468 over the measured base (above the +105-190 paper
+--   band -- the leak uses shallow Fmax-protective stages + the top dither adds a
+--   second threshold bank), still comfortable: ~1,250 LC under the 5,500 target.
+--   Latency 52 -> 56 (/4). Gate-3 owns the worst-seed re-confirmation.
 --
 -- Register map (SPI: pots -> registers_in(0..5), toggles -> (6) bits 0..4,
 --               fader -> (7), timing ID -> (8)(3 downto 0) [unused: all-formats]):
 --   Knob 1  registers_in(0)     QUANTIZE   sequency-weighted deadzone
 --   Knob 2  registers_in(1)     TILT       bass<->treble, attenuate-only (512=flat)
---   Knob 3  registers_in(2)     SCRAMBLE   basis permutation depth (index XOR)
+--   Knob 3  registers_in(2)     SCRAMBLE   basis permutation depth (index XOR/Rotate)
 --   Knob 4  registers_in(3)     REGEN      vertical coefficient feedback
---   Knob 5  registers_in(4)     CROSSTALK  RESERVED/INERT (read, not acted on)
+--   Knob 5  registers_in(4)     CROSSTALK  LIVE: Y->C residual leak (bipolar, 512=OFF;
+--                                          k = top-3-bits -> barrel shift, no multiply)
 --   Knob 6  registers_in(5)     ADAPT      energy -> quantizer self-mod (Y-driven)
---   Tog 7   registers_in(6)(0)  Quantizer  Hard/Dithered (Dithered inert v1)
---   Tog 8   registers_in(6)(1)  ScrMode    XOR/Rotate    (Rotate inert v1)
+--   Tog 7   registers_in(6)(0)  Quantizer  LIVE: Hard / Dithered (LFSR deadzone-edge)
+--   Tog 8   registers_in(6)(1)  ScrMode    LIVE: XOR / Rotate (rotate 0->0 keeps DC)
 --   Tog 9   registers_in(6)(2)  ADAPT pol  Normal/Inverted
 --   Tog 10  registers_in(6)(3)  SpecHold   Live/Hold
---   Tog 11  registers_in(6)(4)  Chroma     RESERVED/INERT (U/V passthrough; read, ignored)
---   Fader   registers_in(7)     Dry/Wet    interpolator_u crossfade
+--   Tog 11  registers_in(6)(4)  Chroma     LIVE: leak master (Luma only=off / Chroma too=on)
+--   Fader   registers_in(7)     Dry/Wet    interpolator_u crossfade (gates the leak)
 --
 -- No resets (iCE40 has none): every register/BRAM relies on signal init.
 --------------------------------------------------------------------------------
@@ -163,13 +200,15 @@ entity wht_organ_lane is
     pos         : in  unsigned(3 downto 0);           -- avid-anchored mod-16 index
     -- shared control (derived once at top; identical to all 3 lanes)
     -- QUANTIZE deadzone thresholds, precomputed per C_QSHIFT band (qeff<<k +
-    -- ADAPT, clamped >=0). Block-stable -> hoisted out of the per-coefficient Q3
-    -- critical path at the top (Gate-1 timing fix); the lane just band-selects.
-    q_th0       : in  signed(17 downto 0);            -- band k=0 threshold
+    -- ADAPT, clamped >=0) and OPTIONALLY dithered at the top (Tog 7 subtracts a
+    -- band-scaled LFSR sample). Block-stable -> hoisted out of the per-coefficient
+    -- Q3 critical path at the top; the lane just band-selects + compares.
+    q_th0       : in  signed(17 downto 0);            -- band k=0 threshold (opt. dithered)
     q_th1       : in  signed(17 downto 0);            -- band k=1 threshold
     q_th2       : in  signed(17 downto 0);            -- band k=2 threshold
     q_th3       : in  signed(17 downto 0);            -- band k=3 threshold
-    scr_key     : in  unsigned(3 downto 0);           -- SCRAMBLE index XOR key
+    scr_key     : in  unsigned(3 downto 0);           -- SCRAMBLE index key (XOR key / rotate amount)
+    scr_mode    : in  std_logic;                      -- Tog 8: 0 = XOR, 1 = 4-bit barrel-Rotate (0->0 keeps DC)
     tilt_dir    : in  std_logic;                      -- 0 = cut highs (bass), 1 = cut lows
     tilt_str    : in  unsigned(1 downto 0);           -- runtime TILT strength 0..3
     regen_sh    : in  unsigned(1 downto 0);           -- REGEN feedback right-shift-1 (gain <=1/2)
@@ -282,6 +321,21 @@ architecture rtl of wht_organ_lane is
     return sh;
   end function;
 
+  -- SCRAMBLE index permutation (Tog 8). XOR = full basis chaos (a non-zero key
+  -- relocates DC at depth); Rotate = 4-bit barrel-rotate = structured rebasing
+  -- that maps index 0 -> 0, so the DC coefficient stays home (brightness kept).
+  -- key 0 -> identity in BOTH modes (Scramble knob at 0 is neutral either way).
+  function scramble_idx(seq : unsigned(3 downto 0);
+                        key : unsigned(3 downto 0);
+                        mode : std_logic) return unsigned is
+  begin
+    if mode = '0' then
+      return seq xor key;                                     -- XOR permutation
+    else
+      return rotate_left(seq, to_integer(key(3 downto 2)));   -- rotate 0..3 (0->0)
+    end if;
+  end function;
+
 begin
 
   -- ==========================================================================
@@ -346,7 +400,7 @@ begin
   begin
     if rising_edge(clk) then
       v_seq  := pos - to_unsigned(OFF_Q mod 16, 4);   -- true sequency of this coeff
-      v_seff := v_seq xor scr_key;                     -- SCRAMBLE: permute param index
+      v_seff := scramble_idx(v_seq, scr_key, scr_mode); -- SCRAMBLE (XOR or Rotate)
       v_tsh  := tilt_amt(v_seff, tilt_dir, tilt_str);
       s_c_tilt <= shift_right(resize(f_out(4), 16), v_tsh);  -- >> only (no overflow)
       s_seq1   <= v_seq;
@@ -415,17 +469,16 @@ begin
   end process;
 
   -- ==========================================================================
-  -- Q3 : QUANTIZE hard deadzone. threshold = (qeff << C_QSHIFT[seq_eff]) + ADAPT.
-  --      DC (true seq 0) exempt -> QUANTIZE=0 keeps everything (identity core).
-  --
-  --      TIMING FIX (Gate 1): the threshold is block-stable (qeff is per-frame,
-  --      ADAPT is per-block), so its shift + 17b add + >=0 clamp are precomputed
-  --      once per block at the top (q_th0..3, one per C_QSHIFT band). This clock
-  --      now does ONLY: band-select (xor + LUT + 4:1 mux) + magnitude compare +
-  --      select — no barrel-shift, no wide add, no clamp on the per-coeff path.
-  --      Bit-identical to the old inline threshold (same value, computed 1 clk
-  --      earlier); ADAPT's block phase shifts by 1 clk (heuristic, within tol),
-  --      identity is exact (thr=0 at QUANTIZE=0 regardless of phase).
+  -- Q3 : QUANTIZE hard deadzone. Band-select the (optionally top-dithered)
+  --      threshold q_th0..3 by C_QSHIFT[scrambled seq], compare |s_c2|, select.
+  --      Single-stage band-select + compare (REV-E form) -> holds Fmax: the Tog-7
+  --      LFSR dither and its band-scaled SUBTRACT live at the TOP (block-stable,
+  --      slack), so this per-coefficient clock adds NOTHING over REV-E except the
+  --      scramble 2:1 mux. Reformulated mag >= (thr - noise): an 18b add in series
+  --      with the 18b compare in ONE clock crashed Fmax to 57 MHz. DC (true seq 0)
+  --      exempt -> QUANTIZE=0 keeps everything (identity core) and DC is bit-
+  --      identical Hard vs Dithered. In Hard mode q_th* = the plain band threshold
+  --      -> bit-exact REV-E.
   -- ==========================================================================
   p_q3 : process(clk)
     variable v_seff : unsigned(3 downto 0);
@@ -434,8 +487,8 @@ begin
     variable v_keep : std_logic;
   begin
     if rising_edge(clk) then
-      v_seff := s_seq2 xor scr_key;
-      case C_QSHIFT(to_integer(v_seff)) is           -- select precomputed band thr
+      v_seff := scramble_idx(s_seq2, scr_key, scr_mode);
+      case C_QSHIFT(to_integer(v_seff)) is           -- select (opt. dithered) band thr
         when 0      => v_th := q_th0;
         when 1      => v_th := q_th1;
         when 2      => v_th := q_th2;
@@ -444,7 +497,7 @@ begin
       v_mag := unsigned(abs(s_c2));
 
       if s_seq2 = 0 then
-        v_keep := '1';                                    -- DC exempt
+        v_keep := '1';                                    -- DC exempt (identity core)
       elsif resize(signed('0' & std_logic_vector(v_mag)), 18) >= v_th then
         v_keep := '1';
       else
@@ -549,12 +602,26 @@ use work.core_pkg.all;
 
 architecture sequency of program_top is
 
-  -- Latency re-pointed 44->48 / 48->52 by the Gate-1 REGEN timing fix: the Q2a
-  -- BRAM-read isolation adds 1 real stage (organ 44->45) and a +3 /4-discipline
-  -- pad brings the lane latency to 48. End-to-end (+interpolator 4) = 52, /4.
+  -- Organ core stays 48 (untouched — the leak is post-fader, top-level). REV-F
+  -- retime 52 -> 56 (/4): the Y->C residual leak injects into U/V one output stage
+  -- after the fader, so the whole passthrough set (U/V/dry/sync) rides four more
+  -- fixed alignment clocks and the faded Y is +4-padded to realign. Sync depth is
+  -- FIXED at 56, independent of every knob/toggle/fader (R5/R8).
   constant C_PROCESSING_DELAY_CLKS : integer := 48;  -- lane core incl. Q2a + /4 pad (/4)
-  constant C_SYNC_DELAY_CLKS       : integer := 52;  -- + interpolator (/4)
+  constant C_SYNC_DELAY_CLKS       : integer := 56;  -- + interpolator 4 + leak retime 4 (/4)
   constant C_LAT                   : integer := C_PROCESSING_DELAY_CLKS;
+
+  -- R1 broadcast-safe clamp for the leaked U/V (chroma range [64,960]).
+  function clamp_uv(v : signed) return std_logic_vector is
+  begin
+    if v < to_signed(64, v'length) then
+      return std_logic_vector(to_unsigned(64, 10));
+    elsif v > to_signed(960, v'length) then
+      return std_logic_vector(to_unsigned(960, 10));
+    else
+      return std_logic_vector(to_unsigned(to_integer(v), 10));
+    end if;
+  end function;
 
   -- REGEN address is generated in the Q1 stage's time frame. avid delayed to
   -- ~Q1 gates a per-line active-coeff counter (freeze-during-blank, R7). The
@@ -570,13 +637,27 @@ architecture sequency of program_top is
   signal s_tilt_str : unsigned(1 downto 0) := (others => '0');
   signal s_regen_sh : unsigned(1 downto 0) := (others => '0');
   signal s_regen_en : std_logic := '0';
-  signal s_xt_reserved : unsigned(9 downto 0) := (others => '0');  -- Knob 5 CROSSTALK: reserved/inert (read, unused)
+  signal s_dith     : std_logic := '0';       -- Tog 7  Dithered enable (0=Hard)
+  signal s_scr_mode : std_logic := '0';       -- Tog 8  Scramble mode (0=XOR, 1=Rotate)
   signal s_adapt_en : std_logic := '0';
   signal s_adapt_sh : integer range 0 to 15 := 0;
   signal s_pol      : std_logic := '0';       -- ADAPT polarity (tog 9)
   signal s_hold     : std_logic := '0';       -- Spectral Hold (tog 10)
-  signal s_chroma   : std_logic := '1';       -- Tog 11 Chroma: reserved/inert (read, unused)
   signal s_fader    : unsigned(9 downto 0) := (others => '0');
+
+  -- ------- CROSSTALK leak controls (Knob 5 + Tog 11, LIVE) -------------------
+  -- Bipolar Knob 5: center 512 = OFF; sign picks the opposite-signed U/V polarity
+  -- pairing; |distance| top-3-bits pick the barrel-shift strength (NO multiply).
+  -- Tog 11 is the hard-off master enable. All block-stable (decoded once/frame).
+  signal s_leak_en  : std_logic := '0';       -- master (Tog 11) AND off-center detent
+  signal s_leak_pol : std_logic := '0';       -- 1 = U+= / V-= ; 0 = U-= / V+=
+  signal s_leak_sh  : integer range 0 to 7 := 7;  -- residual right-shift (b=1->7 .. b=7->1)
+
+  -- ------- free-running dither LFSR (Tog 7) ----------------------------------
+  -- 13-bit maximal Galois/Fibonacci LFSR (taps 13,4,3,1). Survives vsync -> the
+  -- one temporal element; stochastic, rate-invariant -> all-formats exempt (spec
+  -- A8/§5). Init non-zero so it never locks. Low 5 bits drive the dither noise.
+  signal s_lfsr : std_logic_vector(12 downto 0) := (others => '1');
 
   -- ------- position counter (avid-anchored mod-16) ---------------------------
   signal s_pos    : unsigned(3 downto 0) := (others => '0');
@@ -597,7 +678,11 @@ architecture sequency of program_top is
   -- select + compare. Computed once (shared by all 3 lanes) — Gate-1 timing fix
   -- (removes the 17b add + barrel-shift + >=0 clamp from the critical path).
   type t_qth is array (0 to 3) of signed(17 downto 0);
-  signal s_q_th : t_qth := (others => (others => '0'));
+  signal s_q_th   : t_qth := (others => (others => '0'));  -- base band thresholds
+  -- Tog-7 dithered thresholds: s_q_th(k) minus a band-scaled LFSR sample, computed
+  -- at the TOP (block-stable, slack) and registered separately so the per-band
+  -- subtract never touches the per-coefficient Q3 compare path. These feed the lane.
+  signal s_q_th_d : t_qth := (others => (others => '0'));
 
   -- ------- REGEN line buffer (Y coefficient feedback only) -------------------
   -- Y : 2048 x 12 = 6 EBR.  (The packed U+V coeff buffer is removed with the
@@ -630,14 +715,41 @@ architecture sequency of program_top is
 
   signal s_dry_y : std_logic_vector(9 downto 0);
 
-  -- ------- U/V + sync +4 tail (48 -> 52, align with the Y interpolator) -------
-  -- 24 bits = passU10 + passV10 + avid/hs/vs/fld. U/V skip the fader (dry=wet
-  -- passthrough) so they ride this tail to reach the same 52 as the faded Y.
-  type t_uvs4 is array (0 to 3) of std_logic_vector(23 downto 0);
-  signal s_uvs_tail : t_uvs4 := (others => (others => '1'));
+  -- ------- passthrough +4 alignment tail (48 -> 52) --------------------------
+  -- Carries the FULL 34-bit delay word (dryY10 + passU10 + passV10 + avid/hs/vs/
+  -- fld) from the BRAM exit (48) to the fader output depth (52). dryY rides along
+  -- (REV-F: the leak's Y_dry reference) so the residual can be formed at 52 with
+  -- no extra BRAM port. U/V/sync then enter the 4-clock leak stage below (52->56).
+  type t_tail is array (0 to 3) of std_logic_vector(33 downto 0);
+  signal s_tail : t_tail := (others => (others => '1'));
 
   -- ------- Y fader output ----------------------------------------------------
   signal s_mix_y : unsigned(9 downto 0);
+
+  -- ------- REV-F Y->C residual leak pipeline (52 -> 56) ----------------------
+  -- L1: residual = Y_out - Y_dry (gated by master enable); carry U/V/sync.
+  -- L2: k barrel-shift (residual >> s_leak_sh, NO multiply); carry U/V/sync.
+  -- L3: opposite-signed inject (U +=/-= inj, V mirror) per Knob-5 polarity.
+  -- L4: R1 clamp [64,960] -> broadcast-safe U/V; sync lands at 56.
+  signal s_lk_res  : signed(12 downto 0) := (others => '0');       -- @53
+  signal s_lk_u1   : unsigned(9 downto 0) := (others => '0');
+  signal s_lk_v1   : unsigned(9 downto 0) := (others => '0');
+  signal s_lk_sy1  : std_logic_vector(3 downto 0) := (others => '1');
+  signal s_lk_inj  : signed(12 downto 0) := (others => '0');       -- @54
+  signal s_lk_u2   : unsigned(9 downto 0) := (others => '0');
+  signal s_lk_v2   : unsigned(9 downto 0) := (others => '0');
+  signal s_lk_sy2  : std_logic_vector(3 downto 0) := (others => '1');
+  signal s_lk_usum : signed(12 downto 0) := (others => '0');       -- @55
+  signal s_lk_vsum : signed(12 downto 0) := (others => '0');
+  signal s_lk_sy3  : std_logic_vector(3 downto 0) := (others => '1');
+  signal s_lk_uo   : std_logic_vector(9 downto 0) := (others => '0'); -- @56
+  signal s_lk_vo   : std_logic_vector(9 downto 0) := (others => '0');
+  signal s_lk_sy4  : std_logic_vector(3 downto 0) := (others => '1');
+
+  -- ------- faded-Y +4 pure-delay pipe (52 -> 56) -----------------------------
+  -- Realigns the faded Y with the leaked U/V (Y itself is NOT leaked). 4 x 10 FF.
+  type t_y56 is array (0 to 3) of unsigned(9 downto 0);
+  signal s_y56 : t_y56 := (others => (others => '0'));
 
 begin
 
@@ -649,6 +761,9 @@ begin
     variable v_tm  : unsigned(9 downto 0);
     variable v_reg : unsigned(9 downto 0);
     variable v_adp : unsigned(9 downto 0);
+    variable v_xt  : signed(10 downto 0);    -- Knob 5 distance from center (bipolar)
+    variable v_xd  : unsigned(10 downto 0);  -- |distance|, 0..512
+    variable v_xb  : unsigned(2 downto 0);   -- top-3-bits leak-strength band 0..7
   begin
     if rising_edge(clk) then
       s_quant <= unsigned(registers_in(0));
@@ -676,10 +791,27 @@ begin
       if v_reg > 16 then s_regen_en <= '1'; else s_regen_en <= '0'; end if;
       s_regen_sh <= not v_reg(9 downto 8);      -- strong->00 (>>1) .. weak->11 (>>4)
 
-      -- CROSSTALK (knob 5): RESERVED / INERT. Dropped in the Gate-1 timing rework
-      -- (the cross-lane V-tap -> mix -> Y-lane Q2 3-input add crashed Fmax to 56.5
-      -- MHz). Read for forward-compat + to keep the 12-control map; NOT acted on.
-      s_xt_reserved <= unsigned(registers_in(4));
+      -- CROSSTALK (knob 5): LIVE — bipolar control for the output-stage Y->C
+      -- effect-residual leak. center 512 = OFF (b=0 center detent). Sign selects
+      -- the opposite-signed U/V polarity pairing; the top 3 bits of |distance|
+      -- select the leak strength as a barrel-SHIFT amount (H4: NO runtime multiply).
+      v_xt := signed('0' & registers_in(4)) - to_signed(512, 11);
+      if v_xt(10) = '1' then
+        s_leak_pol <= '0';                       -- knob < 512 : U -= , V +=
+        v_xd := unsigned(resize(-v_xt, 11));
+      else
+        s_leak_pol <= '1';                       -- knob >= 512 : U += , V -=
+        v_xd := unsigned(resize(v_xt, 11));
+      end if;
+      if v_xd > 511 then v_xb := "111";          -- saturate distance to 9 bits (top 3)
+      else                v_xb := v_xd(8 downto 6); end if;
+      if v_xb = "000" then                        -- center detent -> leak OFF
+        s_leak_en <= '0';
+        s_leak_sh <= 7;
+      else
+        s_leak_en <= registers_in(6)(4);          -- Tog 11 master (Chroma too = enable)
+        s_leak_sh <= 8 - to_integer(v_xb);        -- b=1 -> >>7 (subtle) .. b=7 -> >>1 (vivid)
+      end if;
 
       -- ADAPT (knob 6): energy -> deadzone; bigger knob -> smaller shift -> bigger delta
       v_adp := unsigned(registers_in(5));
@@ -691,10 +823,25 @@ begin
         when others => s_adapt_sh <= 3;
       end case;
 
-      s_pol    <= registers_in(6)(2);
-      s_hold   <= registers_in(6)(3);
-      s_chroma <= registers_in(6)(4);
-      s_fader  <= unsigned(registers_in(7));
+      s_dith     <= registers_in(6)(0);         -- Tog 7 : Hard / Dithered
+      s_scr_mode <= registers_in(6)(1);         -- Tog 8 : XOR / Rotate
+      s_pol      <= registers_in(6)(2);
+      s_hold     <= registers_in(6)(3);
+      s_fader    <= unsigned(registers_in(7));
+    end if;
+  end process;
+
+  -- ==========================================================================
+  -- Free-running dither LFSR (Tog 7 source). 13-bit maximal Fibonacci LFSR
+  -- (taps 13,4,3,1). NOT reset at vsync -> stochastic, rate-invariant noise
+  -- (all-formats exempt, spec A8). Runs every clock; consumed only when Dithered.
+  -- ==========================================================================
+  p_lfsr : process(clk)
+    variable v_fb : std_logic;
+  begin
+    if rising_edge(clk) then
+      v_fb   := s_lfsr(12) xor s_lfsr(3) xor s_lfsr(2) xor s_lfsr(0);
+      s_lfsr <= s_lfsr(11 downto 0) & v_fb;
     end if;
   end process;
 
@@ -766,6 +913,32 @@ begin
   end process;
 
   -- ==========================================================================
+  -- QUANTIZE dither (Tog 7, TOP-level). Per band k: q_th_d(k) = q_th(k) - (LFSR
+  -- sample << k) — a threshold that jitters both ways at the deadzone edge, scaled
+  -- with the band (shift by the CONSTANT k, no barrel shifter) so the sparkle
+  -- lives at the deadzone edge. Reads the ALREADY-REGISTERED s_q_th (one clean
+  -- subtract, block-stable -> slack; NOT on the Q3 compare path). Gated OFF unless
+  -- Dithered AND a real deadzone exists (thr > 0) -> QUANTIZE=0 stays keep-all
+  -- identity and Hard mode passes the plain threshold (bit-exact REV-E). The +1
+  -- clock is on the block-stable threshold, not the coefficient data -> latency 56
+  -- unchanged, identity exact (thr=0 at QUANTIZE=0 regardless of phase).
+  -- ==========================================================================
+  p_qth_dith : process(clk)
+    variable v_noise : signed(17 downto 0);
+  begin
+    if rising_edge(clk) then
+      for k in 0 to 3 loop
+        if s_dith = '1' and s_q_th(k) > 0 then
+          v_noise := shift_left(resize(signed(s_lfsr(4 downto 0)), 18), k);
+          s_q_th_d(k) <= s_q_th(k) - v_noise;
+        else
+          s_q_th_d(k) <= s_q_th(k);
+        end if;
+      end loop;
+    end if;
+  end process;
+
+  -- ==========================================================================
   -- REGEN address pipeline + line-buffer read/write (freeze-during-blank, R7).
   --   read  @ s_qidx (Q1 time)  -> prev-line coeff at Q2
   --   write @ s_qidx delayed 2  -> resonant coeff produced at Q2
@@ -823,9 +996,9 @@ begin
   u_y : entity work.wht_organ_lane
     generic map (G_REGEN_W => 12, G_CLAMP_LO => 64, G_CLAMP_HI => 940)
     port map (clk => clk, pos => s_pos,
-              q_th0 => s_q_th(0), q_th1 => s_q_th(1),
-              q_th2 => s_q_th(2), q_th3 => s_q_th(3),
-              scr_key => s_scr_key,
+              q_th0 => s_q_th_d(0), q_th1 => s_q_th_d(1),
+              q_th2 => s_q_th_d(2), q_th3 => s_q_th_d(3),
+              scr_key => s_scr_key, scr_mode => s_scr_mode,
               tilt_dir => s_tilt_dir, tilt_str => s_tilt_str,
               regen_sh => s_regen_sh, regen_en => s_regen_en,
               hold => s_hold,
@@ -850,16 +1023,12 @@ begin
     end if;
   end process;
 
-  s_dry_y <= s_rd_q2(33 downto 24);
-
-  -- Chroma toggle (Tog 11): RESERVED/INERT. U/V are PASSTHROUGH (dry=wet, no
-  -- blend), not organ-processed; s_chroma is read but not acted on. U/V + sync
-  -- take the +4 tail below to reach 52 (the Y fader output depth). Passthrough
-  -- does no arithmetic, so U/V need no R1 clamp (input is already in-range).
+  s_dry_y <= s_rd_q2(33 downto 24);           -- dry-Y at 48 (fader input)
 
   -- ==========================================================================
   -- Dry/wet fader : ONE interpolator_u, on Y only (principle #4). +4 clocks.
-  -- U/V carry no fader (passthrough). The single * in the design lives here.
+  -- Output s_mix_y (= Y_out) at 52. The single * in the design lives here (the
+  -- organ + the REV-F leak are multiply-free: k is a barrel shift).
   -- ==========================================================================
   mix_y : entity work.interpolator_u
     generic map (G_WIDTH => C_VIDEO_DATA_WIDTH, G_FRAC_BITS => C_VIDEO_DATA_WIDTH,
@@ -869,30 +1038,99 @@ begin
               t => s_fader, result => s_mix_y, valid => open);
 
   -- ==========================================================================
-  -- U/V + sync +4 tail : advance the 48-delayed U/V passthrough AND sync bits to
-  -- 52 (interpolator tail), keeping U/V + data_out.sync aligned with the faded Y
-  -- — a FIXED delay, independent of every knob/toggle/fader (R5/R8).
+  -- Passthrough +4 alignment tail (48 -> 52). Advances the full delay word
+  -- (dryY + U/V + sync) to the fader-output depth so the leak can form the
+  -- residual (Y_out - Y_dry) at 52 and hand U/V/sync to the leak stage. FIXED
+  -- depth, independent of every knob/toggle/fader (R5/R8).
   -- ==========================================================================
-  p_uvs_tail : process(clk)
+  p_tail : process(clk)
   begin
     if rising_edge(clk) then
-      s_uvs_tail(0) <= s_rd_q2(23 downto 0);   -- U,V,avid,hs,vs,fld at 48
-      s_uvs_tail(1) <= s_uvs_tail(0);
-      s_uvs_tail(2) <= s_uvs_tail(1);
-      s_uvs_tail(3) <= s_uvs_tail(2);          -- now at 48
+      s_tail(0) <= s_rd_q2;                    -- full 34-bit word at 48 -> 49
+      s_tail(1) <= s_tail(0);                  -- 50
+      s_tail(2) <= s_tail(1);                  -- 51
+      s_tail(3) <= s_tail(2);                  -- 52 (dryY/U/V/sync aligned to Y_out)
     end if;
   end process;
 
   -- ==========================================================================
-  -- Output assignment (every data_out port driven exactly once, R2).
-  --   Y  = faded organ (52).   U/V = passthrough via the +4 tail (52).
+  -- REV-F Y->C effect-residual leak (52 -> 56). Injects k*(Y_out - Y_dry) into
+  -- U/V, opposite-signed (NTSC cross-color shimmer, sync_bleed S6 precedent).
+  -- Self-nulls: residual is identically 0 at fader-dry or effect-neutral, so
+  -- chroma stays bit-exact regardless of Knob 5 (load-neutral contract). k is a
+  -- barrel shift (NO multiply). R3-safe: the inject saturates at the R1 clamp.
+  --   L1 @53 residual (gated by master enable)   L2 @54 k barrel-shift
+  --   L3 @55 opposite-signed inject               L4 @56 R1 clamp [64,960]
   -- ==========================================================================
-  data_out.y       <= std_logic_vector(s_mix_y);
-  data_out.u       <= s_uvs_tail(3)(23 downto 14);
-  data_out.v       <= s_uvs_tail(3)(13 downto 4);
-  data_out.avid    <= s_uvs_tail(3)(3);
-  data_out.hsync_n <= s_uvs_tail(3)(2);
-  data_out.vsync_n <= s_uvs_tail(3)(1);
-  data_out.field_n <= s_uvs_tail(3)(0);
+  p_leak : process(clk)
+    variable v_res  : signed(12 downto 0);
+    variable v_usum : signed(12 downto 0);
+    variable v_vsum : signed(12 downto 0);
+  begin
+    if rising_edge(clk) then
+      -- L1: effect residual = Y_out(52) - Y_dry(52), gated OFF by the master
+      -- enable (Tog 11 "Luma only" OR Knob 5 center) -> residual forced 0.
+      if s_leak_en = '1' then
+        v_res := signed(resize(s_mix_y, 13))
+               - signed(resize(unsigned(s_tail(3)(33 downto 24)), 13));
+      else
+        v_res := (others => '0');
+      end if;
+      s_lk_res <= v_res;
+      s_lk_u1  <= unsigned(s_tail(3)(23 downto 14));
+      s_lk_v1  <= unsigned(s_tail(3)(13 downto 4));
+      s_lk_sy1 <= s_tail(3)(3 downto 0);
+
+      -- L2: k barrel-shift (top-3-knob-bits -> right-shift; NO runtime multiply)
+      s_lk_inj <= shift_right(s_lk_res, s_leak_sh);
+      s_lk_u2  <= s_lk_u1;
+      s_lk_v2  <= s_lk_v1;
+      s_lk_sy2 <= s_lk_sy1;
+
+      -- L3: opposite-signed inject (U and V take opposite polarity -> rainbow)
+      if s_leak_pol = '1' then
+        v_usum := signed(resize(s_lk_u2, 13)) + s_lk_inj;   -- U += , V -=
+        v_vsum := signed(resize(s_lk_v2, 13)) - s_lk_inj;
+      else
+        v_usum := signed(resize(s_lk_u2, 13)) - s_lk_inj;   -- U -= , V +=
+        v_vsum := signed(resize(s_lk_v2, 13)) + s_lk_inj;
+      end if;
+      s_lk_usum <= v_usum;
+      s_lk_vsum <= v_vsum;
+      s_lk_sy3  <= s_lk_sy2;
+
+      -- L4: R1 broadcast-safe clamp [64,960] (leak inject cannot wrap, R3)
+      s_lk_uo  <= clamp_uv(s_lk_usum);
+      s_lk_vo  <= clamp_uv(s_lk_vsum);
+      s_lk_sy4 <= s_lk_sy3;
+    end if;
+  end process;
+
+  -- ==========================================================================
+  -- Faded-Y +4 pure-delay pipe (52 -> 56): realign the faded Y with the leaked
+  -- U/V. Y is NOT leaked (the leak is Y->C only); this is pure delay.
+  -- ==========================================================================
+  p_y56 : process(clk)
+  begin
+    if rising_edge(clk) then
+      s_y56(0) <= s_mix_y;                     -- 53
+      s_y56(1) <= s_y56(0);                    -- 54
+      s_y56(2) <= s_y56(1);                    -- 55
+      s_y56(3) <= s_y56(2);                    -- 56
+    end if;
+  end process;
+
+  -- ==========================================================================
+  -- Output assignment (every data_out port driven exactly once, R2). All ports
+  -- land at 56: Y = faded organ +4 pad; U/V = leaked passthrough; sync = tail +
+  -- leak carry. Sync depth FIXED at 56, param-independent (R5/R8).
+  -- ==========================================================================
+  data_out.y       <= std_logic_vector(s_y56(3));
+  data_out.u       <= s_lk_uo;
+  data_out.v       <= s_lk_vo;
+  data_out.avid    <= s_lk_sy4(3);
+  data_out.hsync_n <= s_lk_sy4(2);
+  data_out.vsync_n <= s_lk_sy4(1);
+  data_out.field_n <= s_lk_sy4(0);
 
 end architecture sequency;
