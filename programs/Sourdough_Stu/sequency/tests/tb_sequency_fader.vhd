@@ -2,12 +2,13 @@
 -- tb_sequency_fader.vhd  --  Hook #6: dry/wet fader endpoints
 -- ----------------------------------------------------------------------------
 -- 1080p30, neutral knobs, legal content.  Two DUTs:
---   dry : fader=0    -> out must equal in delayed 52 (dry path bypasses organ)
---   wet : fader=1023 -> out must equal in delayed 52 (organ round-trip)
+--   dry : fader=0    -> out must equal in delayed 56 (dry path bypasses organ)
+--   wet : fader=1023 -> out must equal in delayed 56 (organ round-trip)
 -- The dry endpoint isolates the fader + dry delay from the WHT organ: dry PASS
 -- + wet FAIL localizes the identity defect to the organ reconstruction path.
--- Latency 52 (Gate-1 REGEN timing fix). Y content kept in [64,940] so the
--- interpolator output clamp is a no-op on both endpoints.
+-- Latency 56 (REV-F: +4 Y->C leak retime after the fader tail). Y content kept in
+-- [64,940] so the interpolator output clamp is a no-op on both endpoints. Crosstalk
+-- is left at Knob5=0/Tog11 off (leak master OFF) so the dry-Y here IS out.y.
 -- ============================================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -22,7 +23,7 @@ entity tb_sequency_fader is end entity;
 architecture tb of tb_sequency_fader is
   constant CPL : integer := 2200; constant AW : integer := 1920; constant AVS : integer := CPL-AW;
   constant NL  : integer := 10;   constant VBL : integer := 5;   constant LPF : integer := NL+VBL;
-  constant D   : integer := 52;   -- Gate-1 timing-fix latency
+  constant D   : integer := 56;   -- REV-F latency (+4 leak retime)
   signal clk : std_logic := '0'; signal running : boolean := true;
   signal di : t_video_stream_yuv444_30b;
   signal do_dry, do_wet : t_video_stream_yuv444_30b;

@@ -4,7 +4,10 @@
 -- ADVERSARIAL exhaustive-vertex identity oracle, PROMOTED from the Gate-0
 -- scratchpad (tb_sequency_sdf_adv.vhd) into the permanent Gate-2 harness and
 -- ADAPTED to the committed Y-only build: architecture program_top(sequency),
--- LATENCY 52, and the R1 broadcast-safe output clamp [64,940] on Y.
+-- LATENCY 56 (REV-F), and the R1 broadcast-safe output clamp [64,940] on Y.
+-- UNAFFECTED by the REV-F leak: neutral knobs => residual (Y_out - Y_dry) is
+-- identically 0 => the leak cannot perturb identity; U/V stay bit-exact
+-- passthrough regardless of Knob5 (Crosstalk left at 512-center here anyway).
 --
 -- WHY vertices: WHT coefficient + SDF butterfly-intermediate magnitudes are
 -- LINEAR in the input, so they hit their extremes at the VERTICES of the input
@@ -13,11 +16,11 @@
 -- The complete vertex set {rail}^16 = 65536 blocks is the worst-case set for any
 -- width-truncation / low-bit-drop bug.
 --
--- ORACLE (neutral knobs, QUANTIZE=0, TILT=512 flat, fader wet): the organ is a
--- pure 52-clk delay of Y, so
---     expected_out.y = clamp(in.y delayed 52, 64, 940)     (Y rides the R1 clamp)
---     expected_out.u = in.u delayed 52   (U/V are un-clamped passthrough)
---     expected_out.v = in.v delayed 52
+-- ORACLE (neutral knobs, QUANTIZE=0, TILT=512 flat, Crosstalk=512 center, fader
+-- wet): the organ is a pure 56-clk delay of Y, so
+--     expected_out.y = clamp(in.y delayed 56, 64, 940)     (Y rides the R1 clamp)
+--     expected_out.u = clamp(in.u delayed 56, 64, 960)  (REV-F: U/V ride the leak's
+--     expected_out.v = clamp(in.v delayed 56, 64, 960)   R1 broadcast clamp; residual 0)
 -- The clamp is a NO-OP for legal-range vertices, so:
 --   * Phase B EXHAUSTIVE at {G_LO=64,G_HI=940} (clamp-legal rails) => bit-exact
 --     identity for all 65536 sign patterns, ZERO clamp masking — the strongest
@@ -50,7 +53,7 @@ entity tb_sequency_identity_adv is
 end entity;
 
 architecture tb of tb_sequency_identity_adv is
-  constant LAT : integer := 52;             -- Gate-1 timing-fix end-to-end latency
+  constant LAT : integer := 56;             -- REV-F end-to-end latency (+4 leak retime)
   constant HBL : integer := 64;             -- > LAT: pipeline drains each line
   constant BPL : integer := 128;            -- blocks/active-line (128*16 = 2048 = buffer depth)
 
@@ -70,6 +73,15 @@ architecture tb of tb_sequency_identity_adv is
   function clampy(v : integer) return integer is
   begin
     if v < 64 then return 64; elsif v > 940 then return 940; else return v; end if;
+  end function;
+
+  -- REV-F: U/V exit through the leak stage's R1 broadcast-safe clamp [64,960]
+  -- (spec section 1 stage L4 / hook #10), applied unconditionally even when the
+  -- leak is OFF (residual 0 -> U/V = clamp_uv(U_dry)). A no-op for legal-range
+  -- chroma (Phase B rails 64/940); it clamps only Phase A's illegal 0/1023 rails.
+  function clampuv(v : integer) return integer is
+  begin
+    if v < 64 then return 64; elsif v > 960 then return 960; else return v; end if;
   end function;
 
   -- parity of low 4 bits
@@ -97,9 +109,11 @@ begin
   clk <= not clk after 5 ns when not done else '0';
 
   -- NEUTRAL knobs: QUANTIZE=0, TILT=512 (flat — critical: TILT=0 would max-cut
-  -- highs and break identity), fader wet. Everything else 0.
-  regs(1) <= std_logic_vector(to_unsigned(512, 10));
-  regs(7) <= std_logic_vector(to_unsigned(1023, 10));
+  -- highs and break identity), Crosstalk=512 (center, leak OFF), fader wet.
+  -- Everything else 0 (Tog11 "Luma only" => leak master off regardless).
+  regs(1) <= std_logic_vector(to_unsigned(512, 10));   -- TILT flat
+  regs(4) <= std_logic_vector(to_unsigned(512, 10));   -- Crosstalk center (leak off)
+  regs(7) <= std_logic_vector(to_unsigned(1023, 10));  -- fader wet
 
   dut : entity work.program_top(sequency)
     port map (clk=>clk, registers_in=>regs, data_in=>din, data_out=>dout);
@@ -158,7 +172,8 @@ begin
               rep := rep + 1;
             end if;
           end if;
-          if dout.u /= hu(LAT) or dout.v /= hv(LAT) then
+          if to_integer(unsigned(dout.u)) /= clampuv(to_integer(unsigned(hu(LAT)))) or
+             to_integer(unsigned(dout.v)) /= clampuv(to_integer(unsigned(hv(LAT)))) then
             e_uv := e_uv + 1;
           end if;
         end if;

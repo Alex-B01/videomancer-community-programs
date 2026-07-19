@@ -7,16 +7,20 @@
 -- SEQUENCY has no vblank pass, hook #9).  Phased register scenarios exercise the
 -- spec S6 verification hooks:
 --
---   #1  Y round-trip identity  (neutral knobs, fader wet -> out.y == in.y d52)
+--   #1  Y round-trip identity  (neutral knobs, fader wet -> out.y == in.y d56)
 --   #2  block alignment / div16 (active px/line, exp_blocks completions/line)
---   #5  U/V passthrough         (out.u/v == in.u/v d52, legal-range content)
---   #7  latency / sync          (all sync bits == in delayed EXACTLY 52)
+--   #6  U/V passthrough         (out.u/v == in.u/v d56, RE-SCOPED REV-F: bit-exact
+--                                whenever residual is 0 — here Knob5 is driven HOT
+--                                (r4=1023) yet Tog11 = "Luma only" gates the leak
+--                                OFF, so U/V stay bit-exact REGARDLESS of Knob5;
+--                                the leak-ACTIVE case is tb_sequency_leak, hook #13)
+--   #7  latency / sync          (all sync bits == in delayed EXACTLY 56)
 --   #10 broadcast-safe clamp    (out.y in [64,940], out.u/v in [64,960] always)
 --
--- LATENCY = 52 (Gate-1 REGEN timing fix: organ core 48 /4 + interpolator tail 4;
--- C_SYNC_DELAY_CLKS = 52). Every latency assertion here is 52 — the pre-fix 28/44
--- values are RETIRED. Measured true latency independently = 52 (bit-exact organ
--- round-trip at 52; probe in evidence/).
+-- LATENCY = 56 (REV-F: organ core 48 /4 + interpolator tail 4 + Y->C leak retime 4;
+-- C_SYNC_DELAY_CLKS = 56). Every latency assertion here is 56 — the pre-leak 52
+-- (and the pre-fix 28/44) values are RETIRED. Measured true latency independently
+-- = 56 (bit-exact organ round-trip + leak +4 Y-pad; MEASURED_LATENCY logged below).
 --
 -- LATENCY-MEASUREMENT robustness (re-baseline fix): data_out ports ride
 -- s_uvs_tail, which INITIALISES to all-1s (iCE40 has no reset), so data_out.avid
@@ -61,7 +65,7 @@ architecture tb of tb_sequency_corners is
   constant AVS : integer := CPL - AW;                 -- blank-first: avid start
   constant LPF : integer := G_ACT_LINES + G_VBL_LINES; -- lines per field
   constant ILV : boolean := CORNERS(G_CORNER).is_interlaced;
-  constant D   : integer := 52;                       -- spec latency (Gate-1 fix)
+  constant D   : integer := 56;                       -- REV-F latency (48+4 fader+4 leak)
   constant STOP_FIELD : integer := 5;   -- 0 warmup .1-2 neutral .3-4 adversarial
   constant WARMCYC    : integer := 2*CPL;             -- >= 1 full line + pipeline flush
 
@@ -125,7 +129,9 @@ begin
       r(1) := std_logic_vector(to_unsigned(1023, 10));  -- TILT max (cut bass)
       r(2) := std_logic_vector(to_unsigned(1023, 10));  -- SCRAMBLE max
       r(3) := std_logic_vector(to_unsigned(1023, 10));  -- REGEN max
-      r(4) := std_logic_vector(to_unsigned(1023, 10));  -- CROSSTALK max (reserved/inert)
+      r(4) := std_logic_vector(to_unsigned(1023, 10));  -- CROSSTALK max, but Tog11 OFF ->
+                                                        -- leak gated off -> residual 0 ->
+                                                        -- U/V bit-exact (re-scoped hook #6)
       r(5) := std_logic_vector(to_unsigned(1023, 10));  -- ADAPT max
       if cur_field = 4 then
         r(6) := std_logic_vector(to_unsigned(4, 10));   -- tog9 ADAPT polarity inverted (bit2)
@@ -341,8 +347,9 @@ begin
         report "RESULT HOOK2_blockalign " & NAME & ": " &
           str_pf(e_blk = 0) & " (" & integer'image(e_blk) & " errs, " &
           integer'image(lines_checked) & " lines)" severity note;
-        report "RESULT HOOK5_uvpass    " & NAME & ": " &
-          str_pf(e_uv = 0) & " (" & integer'image(e_uv) & " mismatches)" severity note;
+        report "RESULT HOOK6_uvpass    " & NAME & ": " &
+          str_pf(e_uv = 0) & " (" & integer'image(e_uv) &
+          " mismatches; Knob5 hot + Tog11 off => residual 0 => bit-exact)" severity note;
         report "RESULT HOOK7_latency   " & NAME & ": " &
           str_pf(meas_lat = D and e_sync = 0) & " (measured=" &
           integer'image(meas_lat) & " exp=" & integer'image(D) &

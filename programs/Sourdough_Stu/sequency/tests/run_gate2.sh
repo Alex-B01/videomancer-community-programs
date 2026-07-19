@@ -4,13 +4,18 @@
 # Analyzes the SDK+program once (image-tester source ordering) then runs every
 # hook testbench, printing only the machine-readable RESULT/MEASURED lines.
 #
-#   corners  (per corner 0..6): #1 identity . #2 div16 . #5 U/V . #7 lat52+sync . #10 clamp
-#   identity_adv               : #1 STRONGEST (exhaustive 65536-vertex, bit-exact @52)
+#   corners  (per corner 0..6): #1 identity . #2 div16 . #6 U/V . #7 lat56+sync . #10 clamp
+#   identity_adv               : #1 STRONGEST (exhaustive 65536-vertex, bit-exact @56)
 #   fader                      : #6 dry + wet
 #   state                      : #3 REGEN wired/evolving/bounded . #4 Spectral Hold frozen/effective
 #   null                       : #8 rate-class NULL (1080p30 vs 1080p24)
 #   vblank                     : #9 no-vblank-compute NULL (VBL 3 vs 50 lines)
-#   inert                      : #11 reserved CROSSTALK+Chroma+Dithered+Rotate inert
+#   leak    (per corner 0..4)  : #13 Y->C residual leak (model/opposite/polflip/mag~k/4x self-null)
+#   dither  (per corner 0..4)  : #14 Dithered sparkle @ deadzone edge, DC/brightness preserved
+#   rotate  (per corner 0..4)  : #15 Rotate keeps DC home (0->0) vs XOR relocates it
+#   [#11 inert RETIRED at REV-F -- all four controls are LIVE now]
+#
+# LATENCY = 56 (REV-F: organ 48 + interpolator 4 + Y->C leak retime 4).
 #
 # Usage: ./run_gate2.sh [quick]      (quick => adversarial sweep reduced to 4096)
 # Env: source videomancer-sdk/build/oss-cad-suite/environment first (or rely on PATH).
@@ -50,7 +55,8 @@ done < "$WORK/sources.txt"
 
 echo "== analyze harness =="
 for t in video_corner_pkg tb_sequency_corners tb_sequency_identity_adv tb_sequency_fader \
-         tb_sequency_state tb_sequency_null tb_sequency_vblank tb_sequency_inert; do
+         tb_sequency_state tb_sequency_null tb_sequency_vblank \
+         tb_sequency_leak tb_sequency_dither tb_sequency_rotate; do
   ghdl -a --std=08 -frelaxed --workdir="$WORK" "$TESTS/$t.vhd" || { echo "ANALYZE FAIL: $t"; exit 1; }
 done
 
@@ -67,4 +73,6 @@ echo "== #6 fader =="        ; run tb_sequency_fader
 echo "== #3/#4 REGEN+Hold =="; run tb_sequency_state
 echo "== #8 rate-class =="   ; run tb_sequency_null
 echo "== #9 vblank null =="  ; run tb_sequency_vblank
-echo "== #11 inert =="       ; run tb_sequency_inert
+echo "== #13 Y->C leak (five corners) ==" ; for c in 0 1 2 3 4; do run tb_sequency_leak   -gG_CORNER=$c; done
+echo "== #14 Dithered (five corners) ==="  ; for c in 0 1 2 3 4; do run tb_sequency_dither -gG_CORNER=$c; done
+echo "== #15 Rotate (five corners) ====="  ; for c in 0 1 2 3 4; do run tb_sequency_rotate -gG_CORNER=$c; done
