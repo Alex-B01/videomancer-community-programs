@@ -172,8 +172,11 @@ architecture howlbox of program_top is
   -- ======================================================================
   signal s_base_shift : t_shift_array(2 downto 0) :=
     (0 => C_SHIFT_STARVE, 1 => C_SHIFT_BODY, 2 => C_SHIFT_SPIN);
-  signal s_norm_shift : t_shift_array(2 downto 0) :=
+  signal s_norm_shift : t_shift_array(2 downto 0) :=          -- primary per-step shift
     (0 => C_SHIFT_STARVE, 1 => C_SHIFT_BODY, 2 => C_SHIFT_SPIN);
+  signal s_norm_shift_b : t_shift_array(2 downto 0) :=        -- secondary (shift-add) shift
+    (0 => C_SHIFT_STARVE, 1 => C_SHIFT_BODY, 2 => C_SHIFT_SPIN);
+  signal s_norm_use_b : std_logic := '0';                    -- add secondary term (non-pow2 class)
 
   -- ======================================================================
   -- Raster tracking (avid-edge active-width measurement, howler-style)
@@ -361,10 +364,12 @@ begin
   rate_norm_inst : entity work.rate_normalizer
     generic map (G_NUM_COEFFS => 3)
     port map (
-      clk        => clk,
-      timing_id  => s_timing_id,
-      base_shift => s_base_shift,
-      norm_shift => s_norm_shift
+      clk          => clk,
+      timing_id    => s_timing_id,
+      base_shift   => s_base_shift,
+      norm_shift   => s_norm_shift,
+      norm_shift_b => s_norm_shift_b,
+      norm_use_b   => s_norm_use_b
     );
 
   -- ======================================================================
@@ -449,14 +454,21 @@ begin
   p_temporal : process (clk)
     variable v_target : signed(17 downto 0);
     variable v_diff   : signed(17 downto 0);
+    variable v_step   : signed(17 downto 0);
+    variable v_spin   : unsigned(9 downto 0);
   begin
     if rising_edge(clk) then
       if s_vsync_start = '1' then
-        -- STARVE death envelope: follows the STARVE knob (mapped to 16-bit scale)
+        -- STARVE death envelope: follows the STARVE knob (mapped to 16-bit scale).
+        -- Rate-normalized shift-ADD (primary + optional secondary) holds the
+        -- wall-clock e-fold constant at non-power-of-2 rates (24/25/50 Hz).
         v_target := signed(resize(shift_left(resize(s_starve, 16), 6), 18));
         v_diff   := v_target - signed(resize(s_sag, 18));
-        s_sag    <= fn_clamp_s_to_u(
-          signed(resize(s_sag, 18)) + shift_right(v_diff, s_norm_shift(0)), 16);
+        v_step   := shift_right(v_diff, s_norm_shift(0));
+        if s_norm_use_b = '1' then
+          v_step := v_step + shift_right(v_diff, s_norm_shift_b(0));
+        end if;
+        s_sag <= fn_clamp_s_to_u(signed(resize(s_sag, 18)) + v_step, 16);
 
         -- body-contact vactrol: follows luma envelope when engaged, else relaxes to 0
         if s_body_on = '1' then
@@ -465,11 +477,18 @@ begin
           v_target := (others => '0');
         end if;
         v_diff := v_target - signed(resize(s_body, 18));
-        s_body <= fn_clamp_s_to_u(
-          signed(resize(s_body, 18)) + shift_right(v_diff, s_norm_shift(1)), 16);
+        v_step := shift_right(v_diff, s_norm_shift(1));
+        if s_norm_use_b = '1' then
+          v_step := v_step + shift_right(v_diff, s_norm_shift_b(1));
+        end if;
+        s_body <= fn_clamp_s_to_u(signed(resize(s_body, 18)) + v_step, 16);
 
         -- Rainbow temporal spin: per-frame phase advance, rate-normalized
-        s_nco_temporal <= s_nco_temporal + shift_right(s_rainbow, s_norm_shift(2));
+        v_spin := shift_right(s_rainbow, s_norm_shift(2));
+        if s_norm_use_b = '1' then
+          v_spin := v_spin + shift_right(s_rainbow, s_norm_shift_b(2));
+        end if;
+        s_nco_temporal <= s_nco_temporal + v_spin;
       end if;
     end if;
   end process p_temporal;
