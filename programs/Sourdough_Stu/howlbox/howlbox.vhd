@@ -21,8 +21,10 @@
 --   vactrol, Rainbow spin) run through a born-in, promotion-ready rate normalizer
 --   so a knob means the same wall-clock feel at every format. True dry/wet crossfade.
 --
---   HOWLBOX is the Phase-1 multiplier/LC-discipline validator: EXACTLY 4 runtime
---   multiplies (M1..M4), everything else shift / LUT / compare.
+--   HOWLBOX is the Phase-1 multiplier/LC-discipline validator: 3 runtime
+--   multiplies (M1 peaking, M2 a1 IIR, M4 NCO); everything else shift / LUT /
+--   compare. The a2 IIR pole is a fixed shift (L1, applied to close HD timing:
+--   drops an in-loop 11x11 mult, ~84% -> ~79% fill, relieves route congestion).
 --
 -- Pipeline (20 processing + 4 interpolator = 24 clocks; divisible by 4):
 --   S0   Input latch + sample NCO phase / STARVE-sag / body accumulators
@@ -30,8 +32,7 @@
 --   S2   AC/DC condition + peaking HF (3-tap horizontal LPF, shift-add)
 --   S3   Peaking product ........................... MULT M1  (node_E times hf)
 --   S4   Peaking sum -> IIR input  x = clamp(base + p1 >> kP)   (R3)
---   S5   IIR taps .................................. MULT M2 (a1 times y[n-1]),
---                                                    MULT M3 (a2 times y[n-2])
+--   S5   IIR taps ......... MULT M2 (a1 times y[n-1]); a2 y[n-2] = fixed shift (L1)
 --   S6   IIR combine (recursion close), freeze-during-blanking (R7), r<1
 --   S7   Rupture: comparator vs node_S-collapsed threshold, invert/fold (0 mult)
 --   S8   NCO sine: quarter-wave LUT + quadrant reflection (registered)
@@ -57,9 +58,9 @@
 --   Coupling nodes, lags, NCO phase, IIR prev-pixel taps : registers -> 0 EBR
 --   TOTAL EBR = 2  (vs physical ceiling 32).
 --
--- Runtime multiplies: 4 (M1..M4), all inline registered. <= 5 cap. 0 multiplier_s.
---   Every other operator is shift / LUT / compare (H4: a plain a b product is a
---   LUT multiplier on this DSP-less die).
+-- Runtime multiplies: 3 (M1, M2, M4), all inline registered. <= 5 cap. 0 multiplier_s.
+--   The a2 IIR pole is a constant shift (L1). Every other operator is shift / LUT /
+--   compare (H4: a plain a b product is a LUT multiplier on this DSP-less die).
 --
 -- Estimated LC ~4,920 (paper) vs 5,500 comfortable target. Serial pipeline
 --   (howler-class); H3 register-bound rule does not apply.
@@ -129,6 +130,7 @@ architecture howlbox of program_top is
   constant C_R_MAX  : integer := 480;      -- a1 cap (< 512 => loop gain < 1)   R7
   constant C_KR     : integer := 9;        -- feedback >> 9  (a/512)
   constant C_KP     : integer := 9;        -- peaking product >> 9
+  constant C_A2_SHIFT : integer := 1;      -- L1: fixed IIR pole a2 = y[n-2] >> 1 => r = sqrt(1/2) < 1
 
   -- Chroma NCO
   constant C_KLEAK    : integer := 10;     -- leak product >> 10
@@ -200,8 +202,7 @@ architecture howlbox of program_top is
   signal s_node_s        : unsigned(9 downto 0)  := to_unsigned(1023, 10);
   signal s_flare         : unsigned(10 downto 0) := (others => '0');
   signal s_collapse      : unsigned(10 downto 0) := (others => '0');
-  signal s_a1            : unsigned(11 downto 0) := (others => '0');
-  signal s_a2            : unsigned(11 downto 0) := (others => '0');
+  signal s_a1            : unsigned(11 downto 0) := (others => '0');   -- IIR resonance (M2) + death-flare
   signal s_rainbow_depth : unsigned(9 downto 0)  := (others => '0');
   signal s_rupt_thresh   : unsigned(10 downto 0) := to_unsigned(1023, 11);
 
@@ -532,14 +533,15 @@ begin
       s_flare    <= unsigned(v_flare(10 downto 0));
       s_collapse <= unsigned(v_collapse(10 downto 0));
 
-      -- ring pole radius a1 (r<1): RING + node_E boost + flare peak - collapse
+      -- resonance drive a1 (r<1): RING + node_E boost + flare peak - collapse.
+      -- a1 carries ALL runtime resonator control incl. the death-flare (M2); the
+      -- a2 pole is a fixed shift (L1) gated by a1 at S5.
       v_rgain := signed(resize(s_ring, 14))
                + signed(resize(shift_right(s_node_e, C_K_RE), 14))
                + signed(resize(shift_right(s_flare, C_K_RF), 14))
                - signed(resize(shift_right(s_collapse, C_K_RC), 14));
       v_rgain := fn_clamp_band(v_rgain, 0, C_R_MAX);
       s_a1 <= unsigned(v_rgain(11 downto 0));
-      s_a2 <= unsigned(shift_right(v_rgain(11 downto 0), 1));   -- fixed pole ratio
 
       -- rainbow depth: bloom on flare, fade on collapse
       v_depth := signed(resize(s_rainbow, 14))
@@ -649,21 +651,25 @@ begin
   end process p_s4;
 
   -- ======================================================================
-  -- S5: IIR taps .................. MULT M2 (a1 y[n-1]), MULT M3 (a2 y[n-2])
+  -- S5: IIR taps -- MULT M2 (a1 y[n-1]); a2 y[n-2] pole is a FIXED shift (L1).
   --   y[n-1] = s6_y (last output), y[n-2] = s6_y_d1.
   -- ======================================================================
   p_s5 : process (clk)
     variable v_a1 : signed(10 downto 0);
-    variable v_a2 : signed(10 downto 0);
   begin
     if rising_edge(clk) then
-      -- 11-bit operands (values fit -> bit-identical), 11x11 multiplies.
-      v_a1     := resize(signed('0' & std_logic_vector(s_a1)), 11);
-      v_a2     := resize(signed('0' & std_logic_vector(s_a2)), 11);
-      -- Pre-scale (>>kR); 11x11 multiplies. The subtract stays in S6 -- the
-      -- multiply must own its stage (folding the subtract here regresses Fmax).
-      s5_t1    <= resize(shift_right(v_a1 * resize(s6_y, 11), C_KR), 12);      -- MULT M2
-      s5_t2    <= resize(shift_right(v_a2 * resize(s6_y_d1, 11), C_KR), 12);   -- MULT M3
+      -- 11-bit operand (value fits -> bit-identical), 11x11 multiply, pre-scaled.
+      v_a1  := resize(signed('0' & std_logic_vector(s_a1)), 11);
+      s5_t1 <= resize(shift_right(v_a1 * resize(s6_y, 11), C_KR), 12);         -- MULT M2
+      -- L1: a2 is a FIXED shift-pole (NO multiply). Gated OFF while the resonator
+      --   is idle (a1 = 0) so RING=0 stays a clean passthrough (hook 5). Fixed
+      --   pole r = sqrt(1/2) < 1 (R7). node_S/STARVE de-energizes via a1, which
+      --   also gates this pole -> bounded decay + death-flare collapse preserved.
+      if s_a1 = 0 then
+        s5_t2 <= (others => '0');
+      else
+        s5_t2 <= resize(shift_right(s6_y_d1, C_A2_SHIFT), 12);
+      end if;
       s5_x     <= s4_x;
       s5_u     <= s4_u;
       s5_v     <= s4_v;
