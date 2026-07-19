@@ -16,13 +16,18 @@
 # Env: source videomancer-sdk/build/oss-cad-suite/environment first (or rely on PATH).
 # ============================================================================
 set -uo pipefail
-trap 'rc=$?; echo "RUN_GATE2_DONE (exit $rc)"' EXIT
+# Build artifacts live in $WORK OUTSIDE the repo (set below); the trap removes it
+# on exit unless the caller pinned GATE2_WORK. KEEP_WORK defaults to 1 so an early
+# exit (before $WORK is set) never rm's anything. See build-artifact hygiene in
+# docs/runbooks/agentic-pipeline.md.
+trap 'rc=$?; [ "${KEEP_WORK:-1}" = 0 ] && [ -n "${WORK:-}" ] && rm -rf "$WORK"; echo "RUN_GATE2_DONE (exit $rc)"' EXIT
 
 ROOT=/Users/hellomello/Developer/Videomancer
 SDK=$ROOT/videomancer-community-programs/videomancer-sdk
 PROG=$ROOT/videomancer-community-programs/programs/Sourdough_Stu/sequency
 TESTS=$PROG/tests
 WORK=${GATE2_WORK:-/tmp/sequency_gate2_work}
+[ -n "${GATE2_WORK:-}" ] && KEEP_WORK=1 || KEEP_WORK=0
 VENVPY=$SDK/tools/vhdl-image-tester/.venv/bin/python
 ADV_SWEEP=65535
 [ "${1:-}" = "quick" ] && ADV_SWEEP=4095
@@ -49,7 +54,10 @@ for t in video_corner_pkg tb_sequency_corners tb_sequency_identity_adv tb_sequen
   ghdl -a --std=08 -frelaxed --workdir="$WORK" "$TESTS/$t.vhd" || { echo "ANALYZE FAIL: $t"; exit 1; }
 done
 
-run() { ghdl --elab-run --std=08 -frelaxed --workdir="$WORK" "$@" 2>&1 | grep -E "RESULT|MEASURED_LATENCY|VIT_DONE|IDENTITY FAIL|FAILED" | grep -Ev "metavalue"; }
+# First arg = unit; the rest are generics. -o "$WORK/<unit>" is REQUIRED, not
+# optional: --workdir holds only the work library, but GHDL's llvm backend writes
+# the elaborated binary + e~<unit>.o to CWD unless -o redirects them into $WORK.
+run() { local u=$1; shift; ghdl --elab-run --std=08 -frelaxed --workdir="$WORK" -o "$WORK/$u" "$u" "$@" 2>&1 | grep -E "RESULT|MEASURED_LATENCY|VIT_DONE|IDENTITY FAIL|FAILED" | grep -Ev "metavalue"; }
 
 echo "== #1/#2/#5/#7/#10 five corners (+SD extras) =="
 for c in 0 1 2 3 4 5 6; do run tb_sequency_corners -gG_CORNER=$c; done

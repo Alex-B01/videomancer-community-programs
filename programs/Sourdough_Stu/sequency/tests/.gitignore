@@ -1,9 +1,14 @@
-# GHDL analysis/elaboration artifacts
+# GHDL build artifacts. The runners (run_gate2.sh / run_corners.sh) write
+# elaboration output to an out-of-repo $WORK via `ghdl … -o "$WORK/<unit>"`, so
+# nothing should land here; these rules are the belt-and-suspenders net, and
+# build/ is the directory-containment convention for any in-tree build dir.
+build/
 *.o
 *.cf
 e~*
 work-obj*.cf
-# elaborated simulation executables (no extension)
+# Elaborated sim executables (extensionless). Listed by EXACT name: a `tb_*` glob
+# would also swallow the tb_*.vhd SOURCE that lives in this same directory.
 tb_sequency_corners
 tb_sequency_fader
 tb_sequency_inert

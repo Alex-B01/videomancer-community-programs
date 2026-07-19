@@ -6,13 +6,17 @@ set -euo pipefail
 
 # Reliable completion marker: a trap on EXIT fires even on early/error exit or a
 # non-zero grep under pipefail, so an auto-report waiter never orphans.
-trap 'rc=$?; echo "RUN_CORNERS_DONE (exit $rc)"' EXIT
+# $WORK (set below) is an ephemeral build dir OUTSIDE the repo; the trap removes it
+# on exit unless the caller pinned CORNERS_WORK. KEEP_WORK defaults to 1 so an early
+# exit never rm's anything. See build-artifact hygiene in agentic-pipeline.md.
+trap 'rc=$?; [ "${KEEP_WORK:-1}" = 0 ] && [ -n "${WORK:-}" ] && rm -rf "$WORK"; echo "RUN_CORNERS_DONE (exit $rc)"' EXIT
 
 ROOT=/Users/hellomello/Developer/Videomancer
 SDK=$ROOT/videomancer-community-programs/videomancer-sdk
 PROG=$ROOT/videomancer-community-programs/programs/Sourdough_Stu/sequency
 TESTS=$PROG/tests
-WORK=/private/tmp/claude-501/-Users-hellomello-Developer-Videomancer/0d951fe3-e61b-443b-a26e-2b468f6aaee8/scratchpad/ghdl_work
+WORK=${CORNERS_WORK:-/tmp/sequency_corners_work}
+[ -n "${CORNERS_WORK:-}" ] && KEEP_WORK=1 || KEEP_WORK=0
 VENVPY=$SDK/tools/vhdl-image-tester/.venv/bin/python
 
 # shellcheck disable=SC1091
@@ -45,6 +49,8 @@ ghdl -a --std=08 -frelaxed --workdir="$WORK" "$TESTS/tb_sequency_corners.vhd"
 CORNERS=("$@"); [ ${#CORNERS[@]} -eq 0 ] && CORNERS=(0 1 2 3 4 5 6)
 for c in "${CORNERS[@]}"; do
   echo "== elaborate+run corner $c =="
-  ghdl --elab-run --std=08 -frelaxed --workdir="$WORK" tb_sequency_corners \
-       -gG_CORNER="$c" 2>&1 | grep -E "RESULT|MEASURED_LATENCY|HOOK|====|VIT_DONE|error|bound check|TIMEOUT" || true
+  # -o "$WORK/…" redirects the elaborated binary + e~*.o into $WORK; --workdir
+  # alone leaves them in CWD (llvm backend), which is how they leaked into tests/.
+  ghdl --elab-run --std=08 -frelaxed --workdir="$WORK" -o "$WORK/tb_sequency_corners" \
+       tb_sequency_corners -gG_CORNER="$c" 2>&1 | grep -E "RESULT|MEASURED_LATENCY|HOOK|====|VIT_DONE|error|bound check|TIMEOUT" || true
 done
