@@ -20,6 +20,11 @@ program_type = "processing"
 description = "Virtual bent enhancer: coupled peaking, resonant ring, rupture, chroma NCO rainbow and content-driven virtual sync."
 hardware_compatibility = ["rev_a", "rev_b"]
 core = "yuv444_30b"
+# HD runs the program clock at ÷2 (37.125 MHz) so the resonant-IIR loop closes
+# timing with margin; the horizontal pixel-doubling suits the analog aesthetic.
+# SD stays full-rate (÷1 -- the divisor only affects HD). build_programs.sh reads
+# this key (build_programs.sh:349) -> gen_core_config.py -> core_top div2 PLL.
+hd_clock_divisor = 2
 url = "https://github.com/lzxindustries/videomancer-community-programs"
 
 # ---------------------------------------------------------------------------
