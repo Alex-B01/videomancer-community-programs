@@ -1,0 +1,8 @@
+*.cf
+work-*
+e~*
+*.o
+tb_witness_corners
+tb_witness_gaze
+*.ghw
+*.vcd
