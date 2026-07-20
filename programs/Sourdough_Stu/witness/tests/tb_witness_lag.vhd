@@ -163,6 +163,22 @@ begin
       str_pf((abs(evmin-TY1) > 3 or abs(evmax-TY1) > 3) and abs(rel-TY1) <= 3) &
       " (pre-evade cy=" & integer'image(cyrec(0,EVADE_FR-1)) & " evade[min,max]=[" & integer'image(evmin) &
       "," & integer'image(evmax) & "] released cy=" & integer'image(rel) & " (centroid=" & integer'image(TY1) & "))" severity note;
+    -- W1: rate-class COMFORTABLY within +-25% (p24 not at the edge) AND p24 uses its
+    -- secondary correction (settles in <= p30 fields, i.e. the sub-block precision holds)
+    report "RESULT W1_rateclass_comfortable: " &
+      str_pf(wc(1)>=lo and wc(1)<=hi and wc(2)>=lo and wc(2)<=hi and settle(1)<=settle(0)) &
+      " (p24=" & integer'image((100*wc(1))/ref) & "pct ref, i5994=" & integer'image((100*wc(2))/ref) &
+      "pct ref [want 75..125]; p24 settle " & integer'image(settle(1)) & "<= p30 " & integer'image(settle(0)) &
+      " => secondary correction alive)" severity note;
+    -- W2: EVADE from a SETTLED gaze -> bounded non-zero flinch, no divergence to the
+    -- frame edge while held, clean return (R7).  frame-center reflection => target ~ block 8.
+    report "RESULT W2_evade_bounded_flinch: " &
+      str_pf(abs(cyrec(0,EVADE_FR-1)-TY1) <= 3          -- gaze WAS settled on the centroid pre-evade
+             and (TY1 - evmin) >= 6                      -- non-zero flinch away from centroid
+             and evmin >= 2 and evmax <= 31             -- bounded on-screen, no divergence to floor/edge
+             and abs(rel-TY1) <= 3) &                    -- returns cleanly on release
+      " (settled_pre=" & integer'image(cyrec(0,EVADE_FR-1)) & " flinch_to=" & integer'image(evmin) &
+      " (bounded, target~8) return=" & integer'image(rel) & ")" severity note;
     report "VIT_DONE lag" severity note;
     wait;
   end process;
