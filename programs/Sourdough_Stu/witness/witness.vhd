@@ -137,6 +137,13 @@ architecture witness of program_top is
   signal s_dx, s_dy : signed(12 downto 0);
   signal s_r2       : unsigned(23 downto 0);
 
+  -- RINGS second-difference DDA seeds (from the vblank moments unit) + measured dims
+  signal s_ring_phase0, s_ring_dpx0, s_ring_dpy0, s_ring_twok : signed(23 downto 0);
+  signal s_active_w : unsigned(11 downto 0) := to_unsigned(1920, 12);
+  signal s_active_h : unsigned(11 downto 0) := to_unsigned(1080, 12);
+  signal s_wmeas    : unsigned(11 downto 0) := (others => '0');
+  signal s_hmeas    : unsigned(11 downto 0) := (others => '0');
+
   ------------------------------------------------------------------------
   -- hue-octant approximator
   ------------------------------------------------------------------------
@@ -180,13 +187,19 @@ architecture witness of program_top is
   signal s_sync_pipe : t_sync4 := (others => (others => '0'));
 
   ------------------------------------------------------------------------
-  -- RINGS pipeline
+  -- RINGS second-difference DDA (D4) — phase = k*r^2 generated adds-only
   ------------------------------------------------------------------------
-  signal s_r2_g0 : unsigned(23 downto 0) := (others => '0');
-  signal s_k2_g0 : unsigned(9 downto 0)  := (others => '0');
-  signal s_ring_prod : unsigned(33 downto 0) := (others => '0');
-  signal s_ring_ph   : unsigned(9 downto 0)  := (others => '0');
-  signal s_ring_fr   : signed(10 downto 0)   := (others => '0');
+  signal s_r2_g0  : unsigned(23 downto 0) := (others => '0');   -- r^2 carried to IRIS
+  signal s_ph     : signed(23 downto 0) := (others => '0');     -- running phase (pixel DDA)
+  signal s_dpx    : signed(23 downto 0) := (others => '0');     -- x step
+  signal s_ph_row : signed(23 downto 0) := (others => '0');     -- line-start phase
+  signal s_dpy    : signed(23 downto 0) := (others => '0');     -- line-start step
+  signal s_ring_ph : unsigned(9 downto 0) := (others => '0');   -- phase low bits -> LUT
+  signal s_ring_fr : signed(10 downto 0) := (others => '0');
+  signal s_yP_d1, s_yP_d2 : unsigned(9 downto 0) := (others => '0');  -- luma carry to fringe
+  -- 3-clock luma slack pad reclaimed from the removed k*r^2 multiply (keeps 36)
+  type t_pad3 is array (0 to 2) of unsigned(9 downto 0);
+  signal s_yR_pad : t_pad3 := (others => (others => '0'));
 
   ------------------------------------------------------------------------
   -- Y wet pipeline nodes
@@ -290,14 +303,21 @@ begin
         s_new_line <= '1';
         s_px <= (others => '0');
         s_py <= s_py + 1;
+        s_hmeas <= s_hmeas + 1;                            -- count active lines this frame
       elsif data_in.avid = '1' then
         s_px <= s_px + 1;
+      end if;
+
+      if data_in.avid = '0' and s_avid_d = '1' then       -- avid falling: latch active width
+        if s_px /= 0 then s_active_w <= s_px + 1; end if;
       end if;
 
       if data_in.vsync_n = '0' and s_vs_d = '1' then       -- vsync active: frame boundary
         s_new_frame <= '1';
         s_frame_end <= '1';
         s_py <= (others => '0');
+        if s_hmeas /= 0 then s_active_h <= s_hmeas; end if; -- latch active height
+        s_hmeas <= (others => '0');
       end if;
     end if;
   end process p_input;
@@ -363,11 +383,15 @@ begin
 
   u_moments : entity work.witness_moments
     port map (
-      clk => clk, active => s_avid, new_line => s_new_line, frame_end => s_frame_end,
-      weight => s_weight, t8_evade => s_t_evade, t9_ellipse => s_t_ell,
+      clk => clk, active => s_avid, cell_addr => s_cell_addr(10 downto 0),
+      weight => s_weight, frame_end => s_frame_end,
+      active_w => s_active_w, active_h => s_active_h,
+      t8_evade => s_t_evade, t9_ellipse => s_t_ell, k2_rings => s_k_rings,
       lag_shift => s_norm_shift(0), lag_shift_b => s_norm_shift_b(0), lag_use_b => s_norm_use_b,
       cx_lag => s_cx_lag, cy_lag => s_cy_lag, cx2 => s_cx2, cy2 => s_cy2,
       ell_maj2 => s_ell_maj2, ell_min2 => s_ell_min2, ell_tilt => s_ell_tilt,
+      ring_phase0 => s_ring_phase0, ring_dpx0 => s_ring_dpx0,
+      ring_dpy0 => s_ring_dpy0, ring_twok => s_ring_twok,
       solve_done => s_solve_done
     );
 
@@ -437,7 +461,8 @@ begin
   end process p_pullclamp;
 
   ------------------------------------------------------------------------
-  -- RINGS: k*r^2 (the sole datapath multiply) -> quarter-wave sin -> modulate
+  -- RINGS: second-difference DDA (D4) -> quarter-wave sin -> modulate (+3 pad)
+  -- phase = k*r^2 generated adds-only (Delta += 2k per pixel); seeds from moments.
   ------------------------------------------------------------------------
   p_rings : process (clk)
     variable v_idx : integer range 0 to 255;
@@ -446,29 +471,47 @@ begin
     variable v_dsh : integer range 2 to 5;
   begin
     if rising_edge(clk) then
-      -- G1 (4): register operands then the inline product (phase wraps -> low bits)
-      s_r2_g0 <= s_r2;
-      s_k2_g0 <= s_k_rings;
-      s_ring_prod <= resize(s_k2_g0 * s_r2_g0(23 downto 14), 34);  -- 10 x 10 -> 20b (THE datapath *)
-      s_ring_ph   <= s_ring_prod(19 downto 10);             -- 10-bit phase
-      -- G2 (1): quarter-wave sin LUT via ONE shared read: bit8 reflects the
-      -- index, bit9 negates -> a single distributed-ROM lookup (not 4 copies).
-      if s_ring_ph(8) = '1' then
-        v_idx := 255 - to_integer(s_ring_ph(7 downto 0));
-      else
-        v_idx := to_integer(s_ring_ph(7 downto 0));
+      s_r2_g0 <= s_r2;                                    -- carry r^2 to IRIS
+
+      -- G1: 2-D second-difference phase DDA (adds only, no multiply)
+      if s_new_frame = '1' then
+        s_ph_row <= s_ring_phase0;
+        s_dpy    <= s_ring_dpy0;
       end if;
+      if s_new_line = '1' then
+        s_ph     <= s_ph_row;
+        s_dpx    <= s_ring_dpx0;
+        s_ph_row <= s_ph_row + s_dpy;
+        s_dpy    <= s_dpy + s_ring_twok;
+      elsif s_avid = '1' then
+        s_ph  <= s_ph + s_dpx;
+        s_dpx <= s_dpx + s_ring_twok;
+      end if;
+      s_ring_ph <= unsigned(s_ph(9 downto 0));            -- phase wraps (low 10 bits)
+
+      -- G2: quarter-wave sin LUT via ONE shared read (bit8 reflect, bit9 negate)
+      if s_ring_ph(8) = '1' then v_idx := 255 - to_integer(s_ring_ph(7 downto 0));
+      else                       v_idx := to_integer(s_ring_ph(7 downto 0)); end if;
       v_smag := signed('0' & C_SINE_QUARTER(v_idx));
       if s_ring_ph(9) = '1' then s_ring_fr <= -v_smag; else s_ring_fr <= v_smag; end if;
-      -- G3 (1): K2-gated fringe add into luma (K2=0 -> no fringe -> identity).
-      -- Depth is a SHIFT of K2 (no 2nd datapath multiply): higher K2 -> less shift.
-      v_gate := s_k2_g0;
+
+      -- luma carry to align with the fringe
+      s_yP_d1 <= s_yP;
+      s_yP_d2 <= s_yP_d1;
+
+      -- G3: K2-gated fringe add into luma (K2=0 -> no fringe -> identity)
+      v_gate := s_k_rings;
       if v_gate = 0 then
-        s_yR <= s_yP;
+        s_yR <= s_yP_d2;
       else
-        v_dsh := 5 - to_integer(s_k2_g0(9 downto 8));
-        s_yR  <= add10(s_yP, resize(shift_right(s_ring_fr, v_dsh), 11));
+        v_dsh := 5 - to_integer(s_k_rings(9 downto 8));
+        s_yR  <= add10(s_yP_d2, resize(shift_right(s_ring_fr, v_dsh), 11));
       end if;
+
+      -- 3-clock slack pad (reclaimed from the removed multiply -> end-to-end 36)
+      s_yR_pad(0) <= s_yR;
+      s_yR_pad(1) <= s_yR_pad(0);
+      s_yR_pad(2) <= s_yR_pad(1);
     end if;
   end process p_rings;
 
@@ -497,7 +540,7 @@ begin
   u_iris : entity work.interpolator_u
     generic map (G_WIDTH => 10, G_FRAC_BITS => 10, G_OUTPUT_MIN => 0, G_OUTPUT_MAX => 1023)
     port map (clk => clk, enable => '1',
-              a => s_yR, b => to_unsigned(64, 10), t => s_iris_t, result => s_yI, valid => open);
+              a => s_yR_pad(2), b => to_unsigned(64, 10), t => s_iris_t, result => s_yI, valid => open);
 
   ------------------------------------------------------------------------
   -- TRAIL: motion-history ghost (T11). t=0 when off -> identity.

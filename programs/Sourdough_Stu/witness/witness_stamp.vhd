@@ -48,11 +48,12 @@ architecture rtl of witness_stamp is
   signal s_hit_d  : std_logic := '0';
   signal s_q      : std_logic_vector(7 downto 0) := (others => '0');
 
-  -- 8 registered orbit centres (recomputed sequentially each frame)
-  type t_cen is array (0 to 7) of signed(12 downto 0);
+  -- 4 registered orbit centres (REV-C: 8->4 slots) recomputed sequentially each frame
+  constant C_SLOTS : integer := 4;
+  type t_cen is array (0 to C_SLOTS - 1) of signed(12 downto 0);
   signal s_cx   : t_cen := (others => (others => '0'));
   signal s_cy   : t_cen := (others => (others => '0'));
-  signal s_load : integer range 0 to 8 := 0;               -- sequential loader index
+  signal s_load : integer range 0 to C_SLOTS := 0;         -- sequential loader index
 begin
 
   ------------------------------------------------------------------------
@@ -67,8 +68,8 @@ begin
     if rising_edge(clk) then
       if new_frame = '1' then
         s_load <= 0;
-      elsif s_load < 8 then
-        v_ang := orbit_angle + to_unsigned(s_load * 32, 8);  -- 45 deg spacing, wraps mod 256
+      elsif s_load < C_SLOTS then
+        v_ang := orbit_angle + to_unsigned(s_load * 64, 8);  -- 90 deg spacing (4 slots), wraps
         v_xy  := C_ORBIT_XY(to_integer(v_ang));              -- single shared ROM read
         v_ox  := signed(v_xy(2 * C_ORBIT_BITS - 1 downto C_ORBIT_BITS));
         v_oy  := signed(v_xy(C_ORBIT_BITS - 1 downto 0));
@@ -96,7 +97,7 @@ begin
       v_addr := 0;
       if setb = '1' then v_base := 256; else v_base := 0; end if;
 
-      for k in 0 to 7 loop
+      for k in 0 to C_SLOTS - 1 loop
         if en = '1' and k < to_integer(count) and v_hit = '0' then
           v_ox := (resize(signed('0' & px), 14) - resize(s_cx(k), 14)) + C_HALF;
           v_oy := (resize(signed('0' & py), 14) - resize(s_cy(k), 14)) + C_HALF;
