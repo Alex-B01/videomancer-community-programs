@@ -35,8 +35,10 @@
 --   PULL shear delay 256x30 (variable_delay_u) ..................... 2
 --   sync + dry Y/U/V 64x34 (variable_delay_u) ...................... 3   = 9 (vs MAX_EBR 14)
 --
--- Multiplier ledger: 4x interpolator_u (fader 3 + IRIS 1) + 1 shared vblank
---   multiplier_s + narrowed divider. RINGS/stamp/ellipse/orbit multiplies all gone.
+-- Multiplier ledger (REV-D Option-A): 4x interpolator_u (fader 3 + IRIS 1) + 2 small
+--   feedforward block-squares (coord dbx^2/dby^2) + narrowed serial divider. The shared
+--   vblank multiplier_s is REMOVED (block-space vignette -> 0 pixel-scale/cx^2/cy^2
+--   products). RINGS/stamp/ellipse/orbit multiplies all gone.
 --
 -- Register map: K1 IRIS(live) K2 RINGS(inert) K3 LAG(live) K4 PULL(live)
 --   K5 ORBIT(inert) K6 EDGE(live) T7 Track(live) T8 Evade(live) T9 Ellipse(inert)
@@ -82,9 +84,6 @@ architecture witness of program_top is
   signal s_vs_d   : std_logic := '1';
   signal s_new_line, s_new_frame, s_frame_end : std_logic := '0';
   signal s_px, s_py : unsigned(11 downto 0) := (others => '0');
-  signal s_active_w : unsigned(11 downto 0) := to_unsigned(1920, 12);
-  signal s_active_h : unsigned(11 downto 0) := to_unsigned(1080, 12);
-  signal s_hmeas    : unsigned(11 downto 0) := (others => '0');
 
   ------------------------------------------------------------------------
   -- rate normalizer (G=2: cx, cy) + gaze engine
@@ -94,12 +93,9 @@ architecture witness of program_top is
   signal s_norm_shift_b : t_shift_array(1 downto 0);
   signal s_norm_use_b   : std_logic;
 
-  signal s_cx_lag, s_cy_lag : signed(12 downto 0);
-  signal s_cx2, s_cy2       : unsigned(23 downto 0);
+  signal s_cx_blk, s_cy_blk : signed(8 downto 0);   -- lagged BLOCK gaze
   signal s_solve_done : std_logic;
-
-  signal s_dx, s_dy : signed(12 downto 0);
-  signal s_r2       : unsigned(23 downto 0);
+  signal s_r2       : unsigned(17 downto 0);         -- block-space dr^2
 
   -- hue-octant approximator
   signal s_hue_oct  : unsigned(2 downto 0);
@@ -120,7 +116,7 @@ architecture witness of program_top is
 
   -- IRIS
   signal s_iris_t : unsigned(9 downto 0) := (others => '0');
-  signal s_r2_iris : unsigned(23 downto 0) := (others => '0');
+  signal s_r2_iris : unsigned(17 downto 0) := (others => '0');
   signal s_yI     : unsigned(9 downto 0);
 
   -- luma pad (IRIS-out -> fader input) + U/V carry
@@ -190,21 +186,14 @@ begin
         s_new_line <= '1';
         s_px <= (others => '0');
         s_py <= s_py + 1;
-        s_hmeas <= s_hmeas + 1;
       elsif data_in.avid = '1' then
         s_px <= s_px + 1;
-      end if;
-
-      if data_in.avid = '0' and s_avid_d = '1' then
-        if s_px /= 0 then s_active_w <= s_px + 1; end if;
       end if;
 
       if data_in.vsync_n = '0' and s_vs_d = '1' then
         s_new_frame <= '1';
         s_frame_end <= '1';
         s_py <= (others => '0');
-        if s_hmeas /= 0 then s_active_h <= s_hmeas; end if;
-        s_hmeas <= (others => '0');
       end if;
     end if;
   end process p_input;
@@ -226,16 +215,14 @@ begin
   u_moments : entity work.witness_moments
     port map (clk => clk, active => s_avid, cell_addr => s_cell_addr(10 downto 0),
               luma => s_y_in, sat => s_hue_sat, t7_track => s_t_track,
-              frame_end => s_frame_end, active_w => s_active_w, active_h => s_active_h,
-              t8_evade => s_t_evade,
+              frame_end => s_frame_end, t8_evade => s_t_evade,
               lag_shift => s_norm_shift(0), lag_shift_b => s_norm_shift_b(0), lag_use_b => s_norm_use_b,
-              cx_lag => s_cx_lag, cy_lag => s_cy_lag, cx2 => s_cx2, cy2 => s_cy2,
-              solve_done => s_solve_done);
+              cx_blk_lag => s_cx_blk, cy_blk_lag => s_cy_blk, solve_done => s_solve_done);
 
   u_coord : entity work.witness_coord
-    port map (clk => clk, active => s_avid, new_line => s_new_line, new_frame => s_new_frame,
-              cx_lag => s_cx_lag, cy_lag => s_cy_lag, cx2 => s_cx2, cy2 => s_cy2,
-              dx_o => s_dx, dy_o => s_dy, r2_o => s_r2);
+    port map (clk => clk, active => s_avid,
+              block_x => s_blk_x(5 downto 0), block_y => s_blk_y(4 downto 0),
+              cx_blk => s_cx_blk, cy_blk => s_cy_blk, r2_o => s_r2);
 
   ------------------------------------------------------------------------
   -- PULL bounded shear (K4)
@@ -275,17 +262,19 @@ begin
   -- IRIS: r^2 vs radius^2(K1) + K6 EDGE falloff -> darken (t=0 -> identity)
   ------------------------------------------------------------------------
   p_iris_gain : process (clk)
-    variable v_rad2 : unsigned(23 downto 0);
-    variable v_over : unsigned(23 downto 0);
+    variable v_rad2 : unsigned(17 downto 0);
+    variable v_over : unsigned(17 downto 0);
   begin
     if rising_edge(clk) then
-      s_r2_iris <= s_r2;
-      v_rad2 := shift_left(resize(s_k_iris, 24), 13);           -- open (1023) -> darken 0
+      s_r2_iris <= s_r2;                                        -- block-space dr^2 (18b)
+      -- radius^2 threshold in BLOCK units: max on-screen dr^2 ~ 63^2+31^2 ~ 4930,
+      -- so K1 open (1023<<3 = 8184) -> threshold > max -> darken 0 (identity).
+      v_rad2 := shift_left(resize(s_k_iris, 18), 3);
       if s_r2_iris <= v_rad2 then
         s_iris_t <= (others => '0');
       else
         v_over := s_r2_iris - v_rad2;
-        s_iris_t <= resize(shift_right(v_over, 8 + to_integer(s_k_edge(9 downto 8))), 10);
+        s_iris_t <= resize(shift_right(v_over, 2 + to_integer(s_k_edge(9 downto 8))), 10);
       end if;
     end if;
   end process p_iris_gain;
