@@ -18,17 +18,17 @@
 --   Dropped vs full WITNESS: RINGS, ORBIT/stamps, ELLIPSE, TRAIL (K2/K5/T9/T10/T11
 --   are DECLARED but INERT -- SEQUENCY precedent). No framebuffer.
 --
--- Pipeline (as-built, total latency = C_PROCESSING_DELAY_CLKS = 16, ÷4):
---   R  input register .................................... 1  (cum 1)
---   PULL variable_delay_u read (delay 0 @ neutral) ....... 2  (cum 3)
---   PULL edge-clamp register ............................. 1  (cum 4)
---   IRIS interpolator_u (a=y, b=dark, t=darken) .......... 4  (cum 8)   (gain I1 parallel from r^2)
---   IRIS->fader luma pad ................................. 4  (cum 12)  <- fader input
---   FADER 3x interpolator_u (a=dry, b=wet, t=fader) + R1 clamp . 4  (cum 16)
---   Every composite is (a=passthrough, b=effect, t=amount, t=0 at neutral) -> wet==dry
---   bit-exact at load-neutral; the fader gives identity at any mix. Sync + dry Y/U/V
---   ride the 34x64 delay BRAM at a fixed depth, sync carried the last 4 (fader
---   companion) -> data_out sync delayed EXACTLY 16, param-independent (R5, R8).
+-- Pipeline (as-built, declared == actual latency = C_PROCESSING_DELAY_CLKS = 16, ÷4):
+--   WET Y  : input(1) + PULL variable_delay_u(4 @ neutral) + edge-clamp(1)
+--            + IRIS interpolator_u(4) + luma pad(2) + FADER interpolator_u(4) = 16
+--   WET U/V: input(1) + PULL(4) + clamp(1) + U/V carry(6) + FADER(4)          = 16
+--   DRY Y  : input(1) + u_syncdry(11) + FADER(4)                              = 16
+--   SYNC   : input(1) + u_syncdry(11) + fader companion(4)                    = 16 (R5/R8)
+--   variable_delay_u latency = programmed delay (measured; delay<=1 wraps 257, so PULL
+--   is floored at 2 with baseline C_PULL_BASE=4 -> passthrough-aligned at K4=512). All
+--   four paths land at the fader input at cum 12 -> wet == dry BIT-EXACT at neutral;
+--   the fader gives identity at any mix. Sync is a fixed, param-independent shift (R5),
+--   delayed EXACTLY 16 = the declared latency (R8).
 --
 -- EBR map (power-of-two) -- 9 EBR:
 --   unified mass/motion thumbnail 2048x8 (inside witness_moments) ... 4
@@ -57,11 +57,19 @@ use work.rate_normalizer_pkg.all;
 
 architecture witness of program_top is
 
-  constant C_PROCESSING_DELAY_CLKS : integer := 16;    -- total latency (÷4)
-  constant C_DRY_DELAY  : integer := 9;                -- variable_delay programmed (+2 -> dry @ fader input, cum 12)
+  -- Balanced 16-cycle delay map (Gate-2 re-balance). variable_delay_u latency = its
+  -- programmed delay (measured; delay <= 1 WRAPS 257 -> never program < 2). Every
+  -- path is exactly 16 and lands at the fader input at 12 (wet == dry at neutral):
+  --   dry Y  : input(1) + u_syncdry(11)                 + fader(4)      = 16
+  --   sync   : input(1) + u_syncdry(11) + companion(4)                  = 16  (R5/R8)
+  --   wet Y  : input(1) + PULL(4) + clamp(1) + iris(4) + pad(2) + fader(4) = 16
+  --   wet U/V: input(1) + PULL(4) + clamp(1) + uvcarry(6)        + fader(4) = 16
+  constant C_PROCESSING_DELAY_CLKS : integer := 16;    -- declared == actual == 16 (÷4)
+  constant C_PULL_BASE  : integer := 4;                -- PULL baseline delay @ K4=512 (>=2, no wrap)
+  constant C_DRY_DELAY  : integer := 11;               -- u_syncdry programmed (latency 11 -> dry @ fader input, cum 12)
   constant C_FADER_LAT  : integer := 4;                -- interpolator_u depth (sync carried here -> 16)
-  constant C_IRIS_PAD   : integer := 4;                -- luma pad IRIS-out -> fader input
-  constant C_UV_DELAY   : integer := 8;                -- U/V carry PULL-out -> fader input
+  constant C_IRIS_PAD   : integer := 2;                -- luma pad IRIS-out -> fader input
+  constant C_UV_DELAY   : integer := 6;                -- U/V carry PULL-out -> fader input
 
   ------------------------------------------------------------------------
   -- LIVE parameters (K2/K5/T9/T10/T11 are declared in TOML but INERT: never read)
@@ -228,7 +236,7 @@ begin
   -- PULL bounded shear (K4)
   ------------------------------------------------------------------------
   p_shear : process (clk)
-    variable v_off : signed(15 downto 0);
+    variable v_del : signed(16 downto 0);
   begin
     if rising_edge(clk) then
       if s_new_frame = '1' then
@@ -236,10 +244,13 @@ begin
       elsif s_new_line = '1' then
         s_shear_acc <= s_shear_acc + resize(signed('0' & s_k_pull) - to_signed(512, 11), 16);
       end if;
-      v_off := shift_right(s_shear_acc, 4);
-      if v_off < 0 then s_pull_delay <= (others => '0');
-      elsif v_off > 255 then s_pull_delay <= to_unsigned(255, 8);
-      else s_pull_delay <= unsigned(v_off(7 downto 0)); end if;
+      -- delay = C_PULL_BASE + shear, clamped to [2,255]. K4=512 -> shear 0 -> delay
+      -- = C_PULL_BASE (passthrough-aligned); floor 2 because delay <=1 wraps the SDK
+      -- variable_delay_u (257-cycle). This is the BUG-1 fix.
+      v_del := resize(to_signed(C_PULL_BASE, 17) + resize(shift_right(s_shear_acc, 4), 17), 17);
+      if v_del < 2 then s_pull_delay <= to_unsigned(2, 8);
+      elsif v_del > 255 then s_pull_delay <= to_unsigned(255, 8);
+      else s_pull_delay <= unsigned(v_del(7 downto 0)); end if;
     end if;
   end process p_shear;
 
