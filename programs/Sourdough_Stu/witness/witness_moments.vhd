@@ -99,9 +99,13 @@ architecture rtl of witness_moments is
   signal s_dbit   : integer range 0 to C_DW := 0;
 
   signal s_cxb, s_cyb : unsigned(6 downto 0) := (others => '0');   -- raw block centroid
-  signal s_cxbl, s_cybl : signed(8 downto 0) := (others => '0');   -- lagged block gaze
-  signal s_deltax, s_deltay : signed(9 downto 0) := (others => '0');
-  signal s_stepx, s_stepy   : signed(9 downto 0) := (others => '0');
+  -- W1: lagged block gaze carried in SUB-BLOCK fixed-point (Q C_LAG_FRAC) so the
+  -- 1-pole shifts (incl. the secondary norm_shift_b) do not truncate to 0 on small
+  -- block deltas -> rate-class dynamics are finer. Only the INTEGER part renders.
+  constant C_LAG_FRAC : integer := 5;                             -- fractional bits
+  signal s_cxlq, s_cylq : signed(13 downto 0) := (others => '0'); -- 9 int + 5 frac
+  signal s_deltax, s_deltay : signed(14 downto 0) := (others => '0');
+  signal s_stepx, s_stepy   : signed(14 downto 0) := (others => '0');
 
   -- LAG pipelined 3 ways (deltas | barrel shifts | adds) so the runtime shift
   -- does not bound Fmax; free (vblank slack).
@@ -137,8 +141,8 @@ begin
     port map (clk => clk, wr_en => s_m_wr_en, wr_addr => s_m_wr_addr, wr_data => s_m_wr_data,
               rd_addr => s_m_rd_addr, rd_data => s_m_rd_data);
 
-  cx_blk_lag <= s_cxbl;
-  cy_blk_lag <= s_cybl;
+  cx_blk_lag <= s_cxlq(13 downto C_LAG_FRAC);   -- integer block part -> render (block-quantized)
+  cy_blk_lag <= s_cylq(13 downto C_LAG_FRAC);
 
   p_solve : process (clk)
     variable v_v      : unsigned(7 downto 0);
@@ -155,7 +159,7 @@ begin
     variable v_ndiff  : signed(10 downto 0);
     variable v_old    : unsigned(7 downto 0);
     variable v_new    : signed(11 downto 0);
-    variable v_delta, v_step, v_tgt : signed(9 downto 0);
+    variable v_step, v_tgt, v_cenq : signed(14 downto 0);   -- LAG in Q C_LAG_FRAC
   begin
     if rising_edge(clk) then
       solve_done <= '0';
@@ -270,16 +274,22 @@ begin
           if s_dbit = 0 then s_cyb <= resize(s_quo(6 downto 0), 7); s_state <= S_LAG1;
           else div_step(s_rem, s_quo, s_dvd, s_dsor, s_dbit); end if;
 
-        when S_LAG1 =>          -- EVADE target + delta (subtract)
-          if t8_evade = '1' then v_tgt := shift_left(resize(s_cxbl, 10), 1) - resize(signed('0' & s_cxb), 10);
-          else                   v_tgt := resize(signed('0' & s_cxb), 10); end if;
-          s_deltax <= v_tgt - resize(s_cxbl, 10);
-          if t8_evade = '1' then v_tgt := shift_left(resize(s_cybl, 10), 1) - resize(signed('0' & s_cyb), 10);
-          else                   v_tgt := resize(signed('0' & s_cyb), 10); end if;
-          s_deltay <= v_tgt - resize(s_cybl, 10);
+        when S_LAG1 =>          -- target + delta, in Q C_LAG_FRAC
+          -- W2: EVADE reflects the centroid across the FRAME CENTER (block (32,16)),
+          -- NOT the gaze -> a consistent bounded flinch that is non-zero from a
+          -- settled gaze and cannot diverge while T8 is held (target is gaze-independent).
+          v_cenq := shift_left(resize(signed('0' & s_cxb), 15), C_LAG_FRAC);
+          if t8_evade = '1' then v_tgt := to_signed(64 * (2 ** C_LAG_FRAC), 15) - v_cenq;  -- (2*32 - cx)
+          else                   v_tgt := v_cenq; end if;
+          s_deltax <= v_tgt - resize(s_cxlq, 15);
+          v_cenq := shift_left(resize(signed('0' & s_cyb), 15), C_LAG_FRAC);
+          if t8_evade = '1' then v_tgt := to_signed(32 * (2 ** C_LAG_FRAC), 15) - v_cenq;  -- (2*16 - cy)
+          else                   v_tgt := v_cenq; end if;
+          s_deltay <= v_tgt - resize(s_cylq, 15);
           s_state  <= S_LAG2;
 
-        when S_LAG2 =>          -- rate-normalized step (the runtime barrel shift, isolated)
+        when S_LAG2 =>          -- rate-normalized 1-pole step in Q5 (primary + secondary;
+                                -- neither truncates to 0 on small block deltas). Barrel shift isolated.
           v_step := shift_right(s_deltax, lag_shift);
           if lag_use_b = '1' then v_step := v_step + shift_right(s_deltax, lag_shift_b); end if;
           s_stepx <= v_step;
@@ -288,9 +298,9 @@ begin
           s_stepy <= v_step;
           s_state <= S_LAG3;
 
-        when S_LAG3 =>          -- integrate
-          s_cxbl  <= resize(resize(s_cxbl, 10) + s_stepx, 9);
-          s_cybl  <= resize(resize(s_cybl, 10) + s_stepy, 9);
+        when S_LAG3 =>          -- integrate (Q5); only the integer part is rendered
+          s_cxlq  <= resize(resize(s_cxlq, 16) + resize(s_stepx, 16), 14);
+          s_cylq  <= resize(resize(s_cylq, 16) + resize(s_stepy, 16), 14);
           s_state <= S_DONE;
 
         when S_DONE =>
