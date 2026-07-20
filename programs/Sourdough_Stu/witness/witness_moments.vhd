@@ -90,6 +90,12 @@ architecture rtl of witness_moments is
   signal s_M01acc : unsigned(24 downto 0) := (others => '0');
   signal s_rowm10 : unsigned(25 downto 0) := (others => '0');   -- pipelined row M10 contribution
   signal s_m10go  : std_logic := '0';
+  -- Gate-3 Fmax: scan capture stage -- register the BRAM read + position BEFORE the
+  -- moment accumulators, so the s_ram-read -> nested-accumulate chain is 2 cycles.
+  signal s_vreg   : unsigned(7 downto 0) := (others => '0');
+  signal s_xreg   : unsigned(5 downto 0) := (others => '0');
+  signal s_yreg   : unsigned(4 downto 0) := (others => '0');
+  signal s_acc_v2 : std_logic := '0';
 
   constant C_DW   : integer := 22;   -- divider (M10/M00 pre-scaled >>4; quotient <= 63)
   signal s_dvd    : unsigned(C_DW - 1 downto 0) := (others => '0');
@@ -97,6 +103,10 @@ architecture rtl of witness_moments is
   signal s_rem    : unsigned(C_DW - 1 downto 0) := (others => '0');
   signal s_quo    : unsigned(C_DW - 1 downto 0) := (others => '0');
   signal s_dbit   : integer range 0 to C_DW := 0;
+  -- Gate-3 Fmax: 2-phase divider (shift-in | compare-subtract) so the iteration
+  -- is not one long path. Halves throughput to 2 clk/bit -- fine in vblank.
+  signal s_remsh  : unsigned(C_DW - 1 downto 0) := (others => '0');
+  signal s_divph  : std_logic := '0';
 
   signal s_cxb, s_cyb : unsigned(6 downto 0) := (others => '0');   -- raw block centroid
   -- W1: lagged block gaze carried in SUB-BLOCK fixed-point (Q C_LAG_FRAC) so the
@@ -108,32 +118,14 @@ architecture rtl of witness_moments is
   signal s_stepx, s_stepy   : signed(14 downto 0) := (others => '0');
 
   -- LAG pipelined 3 ways (deltas | barrel shifts | adds) so the runtime shift
-  -- does not bound Fmax; free (vblank slack).
-  type t_state is (S_IDLE, S_SCAN, S_DRAIN, S_FIN01, S_DIVCX, S_DIVCY, S_LAG1, S_LAG2, S_LAG3, S_DONE);
+  -- does not bound Fmax; free (vblank slack). Scan drain folded into the scan count.
+  type t_state is (S_IDLE, S_SCAN, S_FIN01, S_DIVCX, S_DIVCY, S_LAG1, S_LAG2, S_LAG3, S_DONE);
   signal s_state : t_state := S_IDLE;
 
   function sat8(a : unsigned) return std_logic_vector is
   begin
     if a > 255 then return x"FF"; else return std_logic_vector(a(7 downto 0)); end if;
   end function;
-
-  procedure div_step(
-      signal rem_s  : inout unsigned(C_DW - 1 downto 0);
-      signal quo_s  : inout unsigned(C_DW - 1 downto 0);
-      signal dvd_s  : in    unsigned(C_DW - 1 downto 0);
-      signal dsor_s : in    unsigned(C_DW - 1 downto 0);
-      signal bit_s  : inout integer range 0 to C_DW) is
-    variable v_rem : unsigned(C_DW - 1 downto 0);
-  begin
-    v_rem := rem_s(C_DW - 2 downto 0) & dvd_s(bit_s - 1);
-    if v_rem >= dsor_s then
-      rem_s <= v_rem - dsor_s;
-      quo_s(bit_s - 1) <= '1';
-    else
-      rem_s <= v_rem;
-    end if;
-    bit_s <= bit_s - 1;
-  end procedure;
 
 begin
 
@@ -215,7 +207,7 @@ begin
             s_M00 <= (others => '0'); s_M10 <= (others => '0'); s_M01 <= (others => '0');
             s_colrun <= (others => '0'); s_rowM00 <= (others => '0'); s_rowXV <= (others => '0');
             s_rowrun <= (others => '0'); s_M01acc <= (others => '0'); s_m10go <= '0';
-            s_scan_i <= (others => '0'); s_acc_vld <= '0';
+            s_scan_i <= (others => '0'); s_acc_vld <= '0'; s_acc_v2 <= '0'; s_divph <= '0';
             s_state  <= S_SCAN;
           end if;
 
@@ -223,14 +215,32 @@ begin
         when S_SCAN =>
           -- pipelined M10: add the previous row's contribution (2-input add, no BRAM)
           if s_m10go = '1' then s_M10 <= s_M10 + s_rowm10; s_m10go <= '0'; end if;
-          s_m_rd_addr <= s_scan_i(10 downto 0);
-          s_acc_i     <= s_scan_i(10 downto 0);
-          s_acc_vld   <= '1';
+
+          -- present the next read address (only while cells remain)
+          if s_scan_i < 2048 then
+            s_m_rd_addr <= s_scan_i(10 downto 0);
+            s_acc_i     <= s_scan_i(10 downto 0);
+            s_acc_vld   <= '1';
+          else
+            s_acc_vld   <= '0';
+          end if;
+
+          -- CAPTURE stage: register the BRAM read + position, clear the cell.
+          -- (breaks the s_ram-read -> accumulate chain -- Gate-3 Fmax fix #1)
           if s_acc_vld = '1' then
-            v_v := unsigned(s_m_rd_data);
-            v_x := s_acc_i(5 downto 0);
-            v_y := s_acc_i(10 downto 6);
+            s_vreg <= unsigned(s_m_rd_data);
+            s_xreg <= s_acc_i(5 downto 0);
+            s_yreg <= s_acc_i(10 downto 6);
+            s_acc_v2 <= '1';
             s_m_wr_addr <= s_acc_i; s_m_wr_data <= (others => '0'); s_m_wr_en <= '1';
+          else
+            s_acc_v2 <= '0';
+          end if;
+
+          -- ACCUMULATE stage: from the REGISTERED read (multiply-free nested sums)
+          if s_acc_v2 = '1' then
+            v_v := s_vreg;
+            v_x := s_xreg;
             if v_x = 0 then
               v_colrun := resize(v_v, 15); v_rowM00 := resize(v_v, 15); v_rowXV := resize(v_v, 21);
             else
@@ -248,11 +258,14 @@ begin
               s_M01acc <= s_M01acc + resize(v_rowrun, 25);
             end if;
           end if;
-          if s_scan_i = 2048 then s_state <= S_DRAIN; else s_scan_i <= s_scan_i + 1; end if;
 
-        when S_DRAIN =>          -- flush the last row's pipelined M10 add
-          if s_m10go = '1' then s_M10 <= s_M10 + s_rowm10; s_m10go <= '0'; end if;
-          s_state <= S_FIN01;
+          -- count 2048 cells + 4 drain cycles (flush capture->accumulate->M10) then solve
+          if s_scan_i = 2052 then
+            s_state  <= S_FIN01;
+            s_divph  <= '0';
+          else
+            s_scan_i <= s_scan_i + 1;
+          end if;
 
         when S_FIN01 =>
           v_m00s := shift_left(resize(s_M00, 26), 5);
@@ -262,17 +275,34 @@ begin
           s_rem  <= (others => '0'); s_quo <= (others => '0'); s_dbit <= C_DW;
           s_state <= S_DIVCX;
 
+        -- 2-phase restoring divide (phase 0: shift-in ; phase 1: compare-subtract)
         when S_DIVCX =>
           if s_dbit = 0 then
             s_cxb  <= resize(s_quo(6 downto 0), 7);
             s_dvd  <= resize(shift_right(s_M01, 4), C_DW); s_dsor <= resize(shift_right(s_M00, 4), C_DW);
-            s_rem  <= (others => '0'); s_quo <= (others => '0'); s_dbit <= C_DW;
+            s_rem  <= (others => '0'); s_quo <= (others => '0'); s_dbit <= C_DW; s_divph <= '0';
             s_state <= S_DIVCY;
-          else div_step(s_rem, s_quo, s_dvd, s_dsor, s_dbit); end if;
+          elsif s_divph = '0' then
+            s_remsh <= s_rem(C_DW - 2 downto 0) & s_dvd(s_dbit - 1);
+            s_divph <= '1';
+          else
+            if s_remsh >= s_dsor then s_rem <= s_remsh - s_dsor; s_quo(s_dbit - 1) <= '1';
+            else                      s_rem <= s_remsh; end if;
+            s_dbit  <= s_dbit - 1;
+            s_divph <= '0';
+          end if;
 
         when S_DIVCY =>
           if s_dbit = 0 then s_cyb <= resize(s_quo(6 downto 0), 7); s_state <= S_LAG1;
-          else div_step(s_rem, s_quo, s_dvd, s_dsor, s_dbit); end if;
+          elsif s_divph = '0' then
+            s_remsh <= s_rem(C_DW - 2 downto 0) & s_dvd(s_dbit - 1);
+            s_divph <= '1';
+          else
+            if s_remsh >= s_dsor then s_rem <= s_remsh - s_dsor; s_quo(s_dbit - 1) <= '1';
+            else                      s_rem <= s_remsh; end if;
+            s_dbit  <= s_dbit - 1;
+            s_divph <= '0';
+          end if;
 
         when S_LAG1 =>          -- target + delta, in Q C_LAG_FRAC
           -- W2: EVADE reflects the centroid across the FRAME CENTER (block (32,16)),
