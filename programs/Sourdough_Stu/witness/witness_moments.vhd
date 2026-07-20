@@ -113,7 +113,11 @@ architecture rtl of witness_moments is
   -- 1-pole shifts (incl. the secondary norm_shift_b) do not truncate to 0 on small
   -- block deltas -> rate-class dynamics are finer. Only the INTEGER part renders.
   constant C_LAG_FRAC : integer := 5;                             -- fractional bits
-  signal s_cxlq, s_cylq : signed(13 downto 0) := (others => '0'); -- 9 int + 5 frac
+  -- Gate-5 safety net: power-on the gaze at the FRAME CENTER (block (32,16)), NOT
+  -- (0,0). So even a worst-case never-solved state renders a CENTERED (visible)
+  -- vignette instead of an off-screen corner. Reset-less, but now a sane default.
+  signal s_cxlq : signed(13 downto 0) := to_signed(32 * (2 ** C_LAG_FRAC), 14);  -- block 32
+  signal s_cylq : signed(13 downto 0) := to_signed(16 * (2 ** C_LAG_FRAC), 14);  -- block 16
   signal s_deltax, s_deltay : signed(14 downto 0) := (others => '0');
   signal s_stepx, s_stepy   : signed(14 downto 0) := (others => '0');
 

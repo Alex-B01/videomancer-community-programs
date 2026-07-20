@@ -89,8 +89,12 @@ architecture witness of program_top is
   signal s_y_in, s_u_in, s_v_in : unsigned(9 downto 0) := (others => '0');
   signal s_avid, s_hs_n, s_vs_n, s_fld_n : std_logic := '0';
   signal s_avid_d : std_logic := '0';
-  signal s_vs_d   : std_logic := '1';
   signal s_new_line, s_new_frame, s_frame_end : std_logic := '0';
+  -- Gate-5 robustness: self-arming, LEVEL-based frame trigger (replaces the
+  -- reset-less vsync falling-edge detector) -- powers up disarmed, arms on active
+  -- video, fires once per vblank, re-arms every frame -> a missed trigger costs
+  -- ONE frame, never a permanent freeze.
+  signal s_frame_armed : std_logic := '0';
   signal s_px, s_py : unsigned(11 downto 0) := (others => '0');
 
   ------------------------------------------------------------------------
@@ -184,7 +188,6 @@ begin
       s_vs_n <= data_in.vsync_n;
       s_fld_n<= data_in.field_n;
       s_avid_d <= data_in.avid;
-      s_vs_d   <= data_in.vsync_n;
 
       s_new_line  <= '0';
       s_new_frame <= '0';
@@ -198,9 +201,17 @@ begin
         s_px <= s_px + 1;
       end if;
 
-      if data_in.vsync_n = '0' and s_vs_d = '1' then
-        s_new_frame <= '1';
-        s_frame_end <= '1';
+      -- Self-arming, LEVEL-based frame trigger (Gate-5 power-on robustness): active
+      -- video ARMS it; the first vblank clock (vsync_n low) while armed FIRES the
+      -- solve and disarms -> exactly one pulse per frame, re-armed every frame, with
+      -- no reset-less edge register. Powers up disarmed; a missed frame self-recovers.
+      if data_in.avid = '1' then
+        s_frame_armed <= '1';
+      end if;
+      if data_in.vsync_n = '0' and s_frame_armed = '1' then
+        s_new_frame   <= '1';
+        s_frame_end   <= '1';
+        s_frame_armed <= '0';
         s_py <= (others => '0');
       end if;
     end if;
