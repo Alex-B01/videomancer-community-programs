@@ -108,3 +108,5 @@ This repository is licensed under **GPL-3.0-only**.
 - All community contributions must be GPL-3.0 compatible
 - Programs retain original author copyright
 - See [LICENSE](LICENSE) for complete terms
+
+*Some programs in this repository **may** have been created with the assistance of AI tools. Contact us if you have any concerns.*
