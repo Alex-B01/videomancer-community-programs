@@ -31,12 +31,15 @@
 -- Read side (input domain; spec §1.1 boundary stages):
 --   RB  : RB <- B_prev (the write base in use) at the input-domain line start;
 --         the x = 0 sample already uses the new RB (RULED Q11)
---   2   Y addr = (RB + x - act0) mod 2048;
---       UV addr = (RB/4 + ((x - act0) >> 2) + 1) mod 512 (one word ahead, so
+--   2   Y addr = (RB + x - a0_m) mod 2048;
+--       UV addr = (RB/4 + ((x - a0_m) >> 2) + 1) mod 512 (one word ahead, so
 --       the single read port delivers next; cur = the word read one sample
---       earlier), f = (x - act0) & 3
+--       earlier), f = (x - a0_m) & 3. a0_m = this input line's first AVID x
+--       (table act0 until seen), taken one sample early from data_in so the
+--       sample before the active start already addresses word 0 (exact q/q+1).
 --   3   EBR read   4 EBR output register (+ previous word)
---   5   interp 1: at f = 0 latch cur, d = next - cur
+--   5   interp 1: at f = 0 latch cur, d = next - cur; d = 0 on the last word
+--       q = actw/4 - 1 (last-word hold, spec §1.1)
 --   6   interp 2: U10 = 4 cur + d f (= cur10 + (d10 f) >> 2 exactly; RULED Q15)
 --   7   R1 clamp Y 64..940, U/V 64..960
 --   8   AVID gate (Y 64, U = V = 512) + output register
@@ -47,6 +50,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.cbv_variant_pkg.all;
 use work.cbv_pkg.all;
 
 entity cbv_tame_buffer is
@@ -63,6 +67,7 @@ entity cbv_tame_buffer is
     -- read side, input domain stage 1
     i_x      : in  unsigned(11 downto 0);
     i_sol    : in  std_logic;
+    i_avid_n : in  std_logic;                -- data_in.avid (the next sample's AVID)
     i_tid    : in  t_tid;
     i_avid7  : in  std_logic;                -- sync chain tap 7
     o_y      : out unsigned(9 downto 0);     -- stage 8
@@ -78,6 +83,9 @@ architecture rtl of cbv_tame_buffer is
   signal s_ram_uv : t_ram_uv := (others => (others => '0'));   -- 2 EBR
 
   signal s_rb    : unsigned(10 downto 0) := (others => '0');
+  signal s_a0    : unsigned(11 downto 0) := to_unsigned(119, 12);
+  signal s_a0ok  : std_logic := '0';
+  signal s_last2, s_last3, s_last4 : std_logic := '0';
   signal s_ra_y  : unsigned(10 downto 0) := (others => '0');
   signal s_ra_uv : unsigned(8 downto 0) := (others => '0');
   signal s_f2, s_f3, s_f4, s_f5 : unsigned(1 downto 0) := (others => '0');
@@ -136,6 +144,8 @@ begin
     variable v_u, v_v   : signed(11 downto 0);
     variable v_y   : unsigned(9 downto 0);
     variable v_rb  : unsigned(10 downto 0);
+    variable v_a0  : unsigned(11 downto 0);
+    variable v_ok  : std_logic;
   begin
     if rising_edge(clk) then
       f := f_fmt(i_tid);
@@ -145,26 +155,38 @@ begin
       else
         v_rb := s_rb;
       end if;
+      -- a0_m of this line: act0 from x = 0, the first AVID x once seen (look-ahead)
+      if i_sol = '1' then v_a0 := to_unsigned(f.act0, 12); v_ok := '0';
+      else v_a0 := s_a0; v_ok := s_a0ok; end if;
+      if v_ok = '0' and i_avid_n = '1' then
+        v_a0 := i_x + 1; v_ok := '1';
+      end if;
+      s_a0 <= v_a0; s_a0ok <= v_ok;
       -- stage 2: addresses
-      v_p := resize(signed('0' & i_x), 14) - to_signed(f.act0, 14);
+      v_p := resize(signed('0' & i_x), 14) - resize(signed('0' & v_a0), 14);
+      if v_p >= 0 and to_integer(shift_right(v_p, 2)) = f.actw / 4 - 1 then s_last2 <= '1'; else s_last2 <= '0'; end if;
       s_ra_y  <= v_rb + unsigned(v_p(10 downto 0));
       s_ra_uv <= v_rb(10 downto 2) + unsigned(v_p(10 downto 2)) + 1;
       s_f2    <= unsigned(v_p(1 downto 0));
       -- stage 3 (EBR read in p_y_rd / p_uv_rd)
-      s_f3 <= s_f2;
+      s_f3 <= s_f2; s_last3 <= s_last2;
       -- stage 4: EBR output register (+ previous word)
       s_y4  <= unsigned(s_q_y);
       s_uv4 <= s_q_uv;
       s_uv4p <= s_uv4;
-      s_f4  <= s_f3;
+      s_f4  <= s_f3; s_last4 <= s_last3;
       -- stage 5: cur / d at f = 0 (cur = word read one sample earlier)
       if s_f4 = 0 then
         v_cu := resize(signed('0' & s_uv4p(15 downto 8)), 10) - 128;
         v_cv := resize(signed('0' & s_uv4p(7 downto 0)), 10) - 128;
         s_cu5 <= v_cu;
         s_cv5 <= v_cv;
-        s_du5 <= (resize(signed('0' & s_uv4(15 downto 8)), 10) - 128) - v_cu;
-        s_dv5 <= (resize(signed('0' & s_uv4(7 downto 0)), 10) - 128) - v_cv;
+        if s_last4 = '1' then
+          s_du5 <= (others => '0'); s_dv5 <= (others => '0');
+        else
+          s_du5 <= (resize(signed('0' & s_uv4(15 downto 8)), 10) - 128) - v_cu;
+          s_dv5 <= (resize(signed('0' & s_uv4(7 downto 0)), 10) - 128) - v_cv;
+        end if;
       end if;
       s_f5 <= s_f4;
       s_y5 <= s_y4;

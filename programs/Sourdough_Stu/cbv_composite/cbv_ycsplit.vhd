@@ -44,6 +44,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.cbv_variant_pkg.all;
 use work.cbv_pkg.all;
 
 entity cbv_ycsplit is
@@ -114,7 +115,7 @@ begin
       -- history (s_sdhK = sd[n-K] while sd[n] is at stage 13)
       s_sdh1 <= i_sd; s_sdh2 <= s_sdh1; s_sdh3 <= s_sdh2; s_sdh4 <= s_sdh3;
       s_avh1 <= i_avid; s_avh2 <= s_avh1;
-      if f.p8 then
+      if C_P8 then
         v_sdnh := s_sdh4; v_sdc := s_sdh2; v_avc := s_avh2;
       else
         v_sdnh := s_sdh2; v_sdc := s_sdh1; v_avc := s_avh1;

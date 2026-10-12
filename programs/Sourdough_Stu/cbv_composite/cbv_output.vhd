@@ -19,33 +19,28 @@
 -- Credits: Syntonie CBV001 Rev C schematic (CC BY-SA 4.0), Phil Baljeu's
 -- Archer trace. Behavioural model only; no schematic artwork is copied.
 --
--- Luma: Yw = y - (y>>3) + (y>>5) (x0.90625); if Yw > 716: knee
---   Yw = 716 + KN[e>>4] + (((KN[(e>>4)+1] - KN[e>>4]) (e & 15)) >> 4),
---   e = sat(Yw - 716, 0, 1023). G_CODEC_ONLY: Yw = y. Written sat(Yw, 0, 1023).
---   The luma is delayed so that it reaches the write register together
---   with U4/V4's results (spec §5.10 "aligned at the write").
--- Write side (rolling base, spec §1.3), write domain = stage 36 newest tag x_w:
+-- Luma (spec rev 4.1 §5.12): Yw = y - (y>>3) + (y>>5) (x0.90625); if Yw > 716: knee
+--   Yw = 716 + KN[e>>4] + (((KN[(e>>4)+1] - KN[e>>4]) (e & 15)) >> 4), e = sat(Yw - 716,
+--   0, 1023). G1 (C_KNEE_CLIP): no knee, Yw = min(Yw, 1023). G_CODEC_ONLY: Yw = y.
+--   Written sat(Yw, 0, 1023). The luma is delayed to the write stage.
+-- Write side (§5.13, rolling base §1.3), write domain = tag n at C_ST_UV8:
 --   B   : B <- (B + S) mod 2048 at every write-domain line start (B_0 = 0);
---         the x = 0 sample already uses the new B (RULED Q11)
---   Y   : p = x_w - h/2 - act0 (notch-centred luma); we = 0 <= p < actw on
---         every line; address (B + p) mod 2048
---   U/V : at each U4-valid tag ((x_w - act0) mod 4 = 2 / 1): word index
---         q = (x_w - act0 - kq)/4, kq = 10 (P=8) / 5 (P=4), exact (RULED Q2);
---         we = 0 <= q < actw/4; address (B/4 + q) mod 512; word (U8, V8)
---   dh_l = 0 in Stage 1 (port reserved).
--- G_LOOPBACK (H2): the write data are the raw input aligned to the write
---   stage: Y of the input sample at the luma position; U/V = (Ucode >> 2,
---   Vcode >> 2) of the input sample at 4 q + act0.
--- Pipeline: 16 y | 17 ya, yb | 18 yg | 19 knee index | 20 KN, dk | 21 dk*f |
---   22 knee | 23 sat | 24 -> delay -> 36 | 37 write registers (T6). RAM write
---   on the next edge.
--- Resources (paper): ~160 LC + luma delay ~120 FF; no EBR (RAMs in cbv_tame_buffer).
+--         the x = 0 sample already uses the new B (Q11)
+--   Y   : p = n.x - h/2 - a0_m; enable 0 <= p < actw on every line;
+--         address (B + p + dh_l) mod 2048
+--   U/V : at each U4-valid tag: q = (n.x - a0_m - kQ)/4, kQ = 10 / 5 (Q2);
+--         enable 0 <= q < actw/4; address (B/4 + q + (dh_l >> 2)) mod 512
+-- G_LOOPBACK (L3): write data = raw input: Y of the input sample at position p,
+--   U/V = (Ucode >> 2, Vcode >> 2) of the input sample at 4 q + a0_m.
+-- Pipeline: YC y | +1 ya, yb | +2 yg | +3 knee index | +4 KN, dk | +5 dk*f |
+--   +6 knee | +7 sat | +8 -> delay -> UV8 | WR write registers (T6).
 --------------------------------------------------------------------------------
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.cbv_variant_pkg.all;
 use work.cbv_pkg.all;
 
 entity cbv_output is
@@ -55,20 +50,21 @@ entity cbv_output is
   );
   port (
     clk      : in  std_logic;
-    i_y      : in  signed(15 downto 0);     -- stage 16
-    i_u8     : in  unsigned(7 downto 0);    -- stage 36
+    i_y      : in  signed(15 downto 0);     -- stage C_ST_YC
+    i_u8     : in  unsigned(7 downto 0);    -- stage C_ST_UV8
     i_v8     : in  unsigned(7 downto 0);
-    i_uv_ok  : in  std_logic;               -- stage 36
-    -- write domain, stage 36
+    i_uv_ok  : in  std_logic;
+    -- write domain (tag n), stage C_ST_UV8
     i_x      : in  unsigned(11 downto 0);
+    i_a0m    : in  unsigned(11 downto 0);
     i_sol    : in  std_logic;
     i_tid    : in  t_tid;
-    i_dh     : in  signed(11 downto 0);     -- dh_l (0 in Stage 1)
+    i_dh     : in  signed(11 downto 0);     -- dh_l of tag n
     -- raw input, stage 1 (G_LOOPBACK only)
     i_raw_y  : in  unsigned(9 downto 0);
     i_raw_u  : in  unsigned(9 downto 0);
     i_raw_v  : in  unsigned(9 downto 0);
-    -- write port registers, stage 37 (T6)
+    -- write port registers, stage C_ST_WR (T6)
     o_we_y   : out std_logic;
     o_wa_y   : out unsigned(10 downto 0);
     o_wd_y   : out unsigned(9 downto 0);
@@ -81,7 +77,7 @@ entity cbv_output is
 end entity cbv_output;
 
 architecture rtl of cbv_output is
-  constant C_YDLY : natural := C_ST_UV8 - 24;   -- 12
+  constant C_YDLY : natural := C_ST_UV8 - (C_ST_YC + 8);
   type t_ydly is array (1 to C_YDLY) of unsigned(9 downto 0);
   signal s_ydly : t_ydly := (others => (others => '0'));
 
@@ -107,7 +103,7 @@ architecture rtl of cbv_output is
 
   -- loopback raw chain (simulation only; never driven when G_LOOPBACK = false):
   -- s_raw(d) = stage-1 input delayed d clocks
-  constant C_RAW_LEN : natural := 56;
+  constant C_RAW_LEN : natural := C_ST_UV8 + C_YE + C_KQ;
   type t_raw is array (1 to C_RAW_LEN) of std_logic_vector(29 downto 0);
   signal s_raw : t_raw := (others => (others => '0'));
 begin
@@ -133,7 +129,7 @@ begin
       v_e := f_satr(resize(s_yg18, 17) - C_KNEE_T, 0, 1023, 16);
       s_ki19 <= unsigned(v_e(9 downto 4));
       s_ef19 <= unsigned(v_e(3 downto 0));
-      if s_yg18 > C_KNEE_T and not G_CODEC_ONLY then s_big19 <= '1'; else s_big19 <= '0'; end if;
+      if s_yg18 > C_KNEE_T and not G_CODEC_ONLY and not C_KNEE_CLIP then s_big19 <= '1'; else s_big19 <= '0'; end if;
       s_yg19 <= s_yg18;
       -- 20: KN reads straight into arithmetic (keeps the 65-entry table in LUTs, A6)
       v_k := to_integer(s_ki19);
@@ -182,14 +178,15 @@ begin
         v_b := s_b;
       end if;
       s_b36 <= v_b;
-      v_py := resize(signed('0' & i_x), 14) - to_signed(f.h2 + f.act0, 14) + resize(i_dh, 14);
-      v_pu := resize(signed('0' & i_x), 14) - to_signed(f.kq + f.act0, 14) + resize(i_dh, 14);
+      -- p, q relative to the measured active start a0_m; dh_l offsets the address only
+      v_py := resize(signed('0' & i_x), 14) - resize(signed('0' & i_a0m), 14) - C_H2;
+      v_pu := resize(signed('0' & i_x), 14) - resize(signed('0' & i_a0m), 14) - C_KQ;
       v_yd := s_ydly(C_YDLY);
       v_uvd := std_logic_vector(i_u8) & std_logic_vector(i_v8);
       if G_LOOPBACK then
-        v_r := s_raw(C_ST_UV8 - 1 + f.ye + f.h2);
+        v_r := s_raw(C_ST_UV8 - 1 + C_YE + C_H2);
         v_yd := unsigned(v_r(29 downto 20));
-        v_r := s_raw(C_ST_UV8 - 1 + f.ye + f.kq);
+        v_r := s_raw(C_ST_UV8 - 1 + C_YE + C_KQ);
         v_uvd := v_r(19 downto 12) & v_r(9 downto 2);
       end if;
       -- Y
@@ -198,7 +195,7 @@ begin
       else
         s_we_y <= '0';
       end if;
-      s_wa_y <= v_b + unsigned(v_py(10 downto 0));
+      s_wa_y <= v_b + unsigned(v_py(10 downto 0)) + unsigned(i_dh(10 downto 0));
       s_wd_y <= v_yd;
       -- U/V
       if i_uv_ok = '1' and v_pu >= 0 and v_pu < f.actw then
@@ -206,7 +203,7 @@ begin
       else
         s_we_uv <= '0';
       end if;
-      s_wa_uv <= v_b(10 downto 2) + unsigned(v_pu(10 downto 2));
+      s_wa_uv <= v_b(10 downto 2) + unsigned(v_pu(10 downto 2)) + unsigned(shift_right(i_dh, 2)(8 downto 0));
       s_q36   <= resize(shift_right(v_pu, 2), 12);
       s_wd_uv <= v_uvd;
       -- pragma translate_off

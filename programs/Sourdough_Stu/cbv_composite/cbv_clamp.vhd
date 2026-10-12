@@ -1,7 +1,7 @@
 -- Copyright (C) 2026 Sourdough Stu
 -- SPDX-License-Identifier: GPL-3.0-only
 --
--- File: cbv_clamp.vhd - CBV Composite TV clamp, porch mode (block 4, spec §5.8)
+-- File: cbv_clamp.vhd - CBV Composite TV clamp, position + gain (spec rev 4.1 §5.7, M11)
 --
 -- This file is free software: you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -19,11 +19,13 @@
 -- Credits: Syntonie CBV001 Rev C schematic (CC BY-SA 4.0), Phil Baljeu's
 -- Archer trace. Behavioural model only; no schematic artwork is copied.
 --
--- hb = x_d + dh_l (dh_l = 0 in Stage 1). The window starts at the first
--- sample of the line with hb >= CA and sums exactly 2^CLS samples of o;
--- BP = sum >> CLS; BPk = (BP*61) >> 6 (Porch) or (BP*77) >> 6 (Picture,
--- CA_in / CLS_in; T11 is tied to Porch in Stage 1). sd = o - BPk; BPk holds
--- until the next window. RULED Q10 (spec rev 3 §13): the window's own samples use the
+-- hb = x_n + dh_l; CA = CA_porch + ((P6 CAspan) >> 10) per line (P6 = Clamp
+-- Pos, registers_in(5)); the window starts at the first sample of the line with
+-- hb >= CA and sums exactly 2^CLS samples of o; BP = sum >> CLS; BPk =
+-- (BP*61) >> 6 (T11 Normal) or (BP*77) >> 6 (T11 Over). sd = o - BPk; BPk holds
+-- until the next window. P6 and T11 latch at this block's x = 0. The product
+-- P6 CAspan is formed bit-serially in the first 11 clocks of the line; no
+-- window can open before x = CA_porch - lim >= 66, so CA is always ready. RULED Q10 (spec rev 3 §13): the window's own samples use the
 -- previous BPk; the new BPk applies from the first sample after the window.
 --
 -- Pipeline: 10 o, decoder domain (x_d) | 11 window sum | 12 BP | 13 BPk, sd.
@@ -35,6 +37,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.cbv_variant_pkg.all;
 use work.cbv_pkg.all;
 
 entity cbv_clamp is
@@ -45,7 +48,9 @@ entity cbv_clamp is
     i_sol    : in  std_logic;
     i_tid    : in  t_tid;
     i_dh     : in  signed(11 downto 0);     -- dh_l (0 in Stage 1)
-    i_pic    : in  std_logic;               -- T11 Picture (tied '0' in Stage 1)
+    i_pic    : in  std_logic;               -- T11 Over (registers_in(6)(4))
+    i_p6     : in  std_logic_vector(9 downto 0);   -- registers_in(5) Clamp Pos
+    o_ca     : out unsigned(11 downto 0);   -- CA of the line (T2)
     o_sd     : out signed(15 downto 0);     -- stage 13
     o_bpk    : out signed(15 downto 0);
     o_bpk_ld : out std_logic                -- '1' on the clock BPk takes a new value
@@ -65,6 +70,13 @@ architecture rtl of cbv_clamp is
   signal s_ld13  : std_logic := '0';
   signal s_o11, s_o12 : signed(13 downto 0) := (others => '0');
   signal s_sd13  : signed(15 downto 0) := (others => '0');
+  signal s_ca    : unsigned(11 downto 0) := to_unsigned(98, 12);
+  signal s_pic   : std_logic := '0';
+  signal s_mp6   : unsigned(9 downto 0) := (others => '0');
+  signal s_macc  : unsigned(20 downto 0) := (others => '0');
+  signal s_mspan : unsigned(20 downto 0) := (others => '0');
+  signal s_mcnt  : unsigned(3 downto 0) := (others => '1');
+  signal s_mbase : unsigned(11 downto 0) := to_unsigned(98, 12);
 begin
 
   p_clamp : process(clk)
@@ -78,11 +90,27 @@ begin
   begin
     if rising_edge(clk) then
       f := f_fmt(i_tid);
-      if i_pic = '1' then
-        v_ca := f.ca_in; v_sh := f.clsh_in;
-      else
-        v_ca := f.ca;    v_sh := f.clsh;
+      -- per-line CA = CA_porch + ((P6 CAspan) >> 10), bit-serial (10 steps)
+      if i_sol = '1' then
+        s_mp6   <= unsigned(i_p6);
+        s_macc  <= (others => '0');
+        s_mspan <= to_unsigned(f.caspan, 21);
+        s_mbase <= to_unsigned(f.ca, 12);
+        s_mcnt  <= (others => '0');
+        s_pic   <= i_pic;
+      elsif s_mcnt < 10 then
+        if s_mp6(0) = '1' then
+          s_macc <= s_macc + s_mspan;
+        end if;
+        s_mp6   <= shift_right(s_mp6, 1);
+        s_mspan <= shift_left(s_mspan, 1);
+        s_mcnt  <= s_mcnt + 1;
+      elsif s_mcnt = 10 then
+        s_ca   <= s_mbase + resize(shift_right(s_macc, 10), 12);
+        s_mcnt <= s_mcnt + 1;
       end if;
+      v_ca := to_integer(s_ca);
+      v_sh := f.clsh;
       v_hb := resize(signed('0' & i_x), 14) + resize(i_dh, 14);
       -- stage 10 -> 11: window sum
       v_arm := s_armed or i_sol;
@@ -99,7 +127,7 @@ begin
         s_wcnt  <= to_unsigned(2 ** v_sh - 1, 7);
         s_armed <= '0';
         s_sh11  <= v_sh;
-        s_pic11 <= i_pic;
+        s_pic11 <= s_pic;
       else
         s_armed <= v_arm;
       end if;
@@ -131,5 +159,6 @@ begin
   o_sd     <= s_sd13;
   o_bpk    <= s_bpk;
   o_bpk_ld <= s_ld13;
+  o_ca     <= s_ca;
 
 end architecture rtl;

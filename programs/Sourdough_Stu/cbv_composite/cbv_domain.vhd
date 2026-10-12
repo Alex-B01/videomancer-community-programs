@@ -32,6 +32,10 @@
 --            3 lines before; holds until the next x = bst
 --   aline  : active line index in field (saturates at 3): reset at the vsync_n
 --            fall, +1 at each line start after a line that carried AVID
+--   a0_m   : measured active start (spec rev 4.1 §2.1): the table act0 from x = 0
+--            until the line's first AVID sample, then that sample's x for the
+--            rest of the line (ambiguity A2: before the first AVID sample the
+--            line's own a0_m is not yet known; = act0 for SDK rasters, A1)
 -- Convention (RULED Q11, spec rev 3 §13): an update made at x = 0 applies to the
 -- line that starts at that x = 0 (sample x = 0 already sees the new psi / lp / tid).
 -- Latency: 1 clock (all outputs aligned with the registered sample).
@@ -42,6 +46,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library work;
+use work.cbv_variant_pkg.all;
 use work.cbv_pkg.all;
 
 entity cbv_domain is
@@ -62,7 +67,8 @@ entity cbv_domain is
     o_tid   : out t_tid;
     o_reg6  : out std_logic_vector(4 downto 0);
     o_vline : out std_logic;
-    o_aline : out unsigned(1 downto 0)
+    o_aline : out unsigned(1 downto 0);
+    o_a0m   : out unsigned(11 downto 0)
   );
 end entity cbv_domain;
 
@@ -82,6 +88,8 @@ architecture rtl of cbv_domain is
   signal s_atbst : std_logic;
   signal s_aline : unsigned(1 downto 0) := (others => '0');
   signal s_had   : std_logic := '0';
+  signal s_a0m   : unsigned(11 downto 0) := to_unsigned(119, 12);
+  signal s_a0ok  : std_logic := '0';
 begin
 
   p_reg : process(clk)
@@ -92,6 +100,18 @@ begin
       s_vs_n <= i_vs_n;
       s_avid <= i_avid;
       v_sol := (i_hs_n = '0') and (s_hs_n = '1');
+      -- a0_m: first AVID sample of the line
+      if v_sol then
+        s_a0m  <= to_unsigned(f_fmt(i_tid).act0, 12);
+        s_a0ok <= '0';
+        if i_avid = '1' then
+          s_a0m  <= (others => '0');
+          s_a0ok <= '1';
+        end if;
+      elsif i_avid = '1' and s_a0ok = '0' then
+        if s_x /= x"FFF" then s_a0m <= s_x + 1; else s_a0m <= s_x; end if;
+        s_a0ok <= '1';
+      end if;
       if v_sol then
         s_x    <= (others => '0');
         s_sol  <= '1';
@@ -143,5 +163,6 @@ begin
   o_reg6  <= s_reg6;
   o_vline <= s_vnow when s_atbst = '1' else s_vhold;
   o_aline <= s_aline;
+  o_a0m   <= s_a0m;
 
 end architecture rtl;
