@@ -167,6 +167,9 @@ architecture rtl of cbv_separator is
   signal s_tln    : unsigned(9 downto 0) := (others => '0');
   signal s_tlc    : unsigned(10 downto 0) := (others => '0');
   signal s_tc     : unsigned(9 downto 0) := (others => '0');
+  signal s_tsh    : unsigned(9 downto 0) := (others => '0');
+  signal s_tacc   : unsigned(21 downto 0) := (others => '0');
+  signal s_trv    : unsigned(21 downto 0) := (others => '0');
   signal s_tll    : unsigned(10 downto 0) := (others => '0');
   signal s_tpl    : unsigned(9 downto 0) := (others => '0');
   signal s_ma     : unsigned(10 downto 0) := (others => '0');
@@ -360,37 +363,26 @@ begin
   end process;
 
   -- ================================================================ Tame (S0+9 .. S0+17)
-  -- TL candidate from registers_in continuously, latched at the MUL stage's x = 0
+  -- TL = (T RINV16) >> 10 for the line, bit-serial (10 shift-add steps) from this
+  -- domain's x = 0; latched at the MUL stage's x = 0 (S0+12), 11 clocks later, so
+  -- it is always complete (spec value unchanged; replaces 4-6 parallel adders).
   p_tl : process(clk)
-    variable v_t : unsigned(9 downto 0);
-    variable v_p : unsigned(21 downto 0);
   begin
     if rising_edge(clk) then
-      v_t := unsigned(i_p2);
-      s_tc <= v_t;
-      -- (T RINV16) >> 10 as shift-adds; RINV16 2048 / 1638 (SD), 819 / 1170 (HD)
-      if not C_HD then
-        if r_lim = 32 then
-          v_p := shift_left(resize(s_tc, 22), 11);
-        else  -- 1638 = 2^11 - 2^8 - 2^7 - 2^4 - 2^3 - 2^1
-          v_p := shift_left(resize(s_tc, 22), 11) - shift_left(resize(s_tc, 22), 8)
-               - shift_left(resize(s_tc, 22), 7) - shift_left(resize(s_tc, 22), 4)
-               - shift_left(resize(s_tc, 22), 3) - shift_left(resize(s_tc, 22), 1);
-        end if;
+      if i_sol = '1' then
+        s_tc   <= unsigned(i_p2);
+        s_tsh  <= unsigned(i_p2);
+        s_tacc <= (others => '0');
+        s_trv  <= to_unsigned(f_fmt(i_tid).rinv16, 22);
       else
-        if r_lim = 80 then  -- 819 = 2^9 + 2^8 + 2^5 + 2^4 + 2^1 + 2^0
-          v_p := shift_left(resize(s_tc, 22), 9) + shift_left(resize(s_tc, 22), 8)
-               + shift_left(resize(s_tc, 22), 5) + shift_left(resize(s_tc, 22), 4)
-               + shift_left(resize(s_tc, 22), 1) + resize(s_tc, 22);
-        else                -- 1170 = 2^10 + 2^7 + 2^4 + 2^1
-          v_p := shift_left(resize(s_tc, 22), 10) + shift_left(resize(s_tc, 22), 7)
-               + shift_left(resize(s_tc, 22), 4) + shift_left(resize(s_tc, 22), 1);
-        end if;
+        if s_tsh(0) = '1' then s_tacc <= s_tacc + s_trv; end if;
+        s_tsh <= shift_right(s_tsh, 1);
+        s_trv <= shift_left(s_trv, 1);
       end if;
-      s_tlc <= resize(shift_right(v_p, 10), 11);
-      s_tpl <= s_tc;
     end if;
   end process;
+  s_tlc <= resize(shift_right(s_tacc, 10), 11);
+  s_tpl <= s_tc;
 
   p_tame : process(clk)
     variable v_d  : signed(20 downto 0);
