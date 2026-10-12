@@ -21,8 +21,9 @@
 --
 -- The whole program with test generics; cbv_composite.vhd (architecture of
 -- program_top) instantiates it with the shipping values. Testbenches
--- instantiate this entity directly and probe the T1-T7 tap signals below
--- (spec-stage1.md §6) with VHDL-2008 external names.
+-- instantiate this entity directly and read the T1-T6 taps from the o_taps
+-- record port (spec-stage1.md §6; T7 = data_out). The t*_ tap signals below
+-- carry the same values (external names do not work in the oss-cad GHDL build).
 --
 -- Generics / test port (spec-stage1.md §1):
 --   G_CODEC_ONLY      true: identity output gain, no knee, codec chroma gains
@@ -65,7 +66,7 @@
 --   sine quarter-wave 256x12 ....... 1   (cbv_m1_rotate)
 --   program total ................. 15   (16 on dual configs incl. the core's)
 -- Multipliers (inferred `*`, none in a 1-clock recursion; no multiplier_s):
---   M1 18x12 (4 slots), M2 19x17 (2 slots); plus small constant/LUT-size
+--   M1 14x12 (4 slots), M2 14x13 (2 slots); plus small constant/LUT-size
 --   products (knee dk*f 5x4, read-side d*f 10x3).
 --
 -- LC estimate (spec-stage1.md §4): (a) 2,440 + (b) 804 + glue 488 = 3,730
@@ -99,7 +100,8 @@ entity cbv_composite_core is
     registers_in      : in  t_spi_ram;
     data_in           : in  t_video_stream_yuv444_30b;
     data_out          : out t_video_stream_yuv444_30b;
-    i_test_burst_gain : in  std_logic := '1'
+    i_test_burst_gain : in  std_logic := '1';
+    o_taps            : out t_cbv_taps      -- Gate-2 taps (open in program_top)
   );
 end entity cbv_composite_core;
 
@@ -158,7 +160,8 @@ architecture rtl of cbv_composite_core is
   signal dy_tid : t_tid;
   signal dy_reg6 : std_logic_vector(4 downto 0);
   signal dy_aline : unsigned(1 downto 0);
-  signal s_y16, s_c16 : signed(15 downto 0);
+  signal s_y16 : signed(15 downto 0);
+  signal s_c16 : signed(12 downto 0);   -- cS
   signal s_comb_en : std_logic;
   signal s_old  : signed(9 downto 0);
   signal s_col_yc : std_logic;
@@ -168,19 +171,19 @@ architecture rtl of cbv_composite_core is
   signal s_solp : t_solp := (others => '0');
 
   -- demod
-  signal s_du, s_dv : signed(17 downto 0);
-  signal s_u4, s_v4 : signed(17 downto 0);
+  signal s_du, s_dv : signed(14 downto 0);
+  signal s_u4, s_v4 : signed(14 downto 0);
   signal s_u4_ok : std_logic;
 
   -- colour engine
   signal s_apc_ph : unsigned(17 downto 0);
   signal s_col_on, s_sw_pic : std_logic;
-  signal s_gu_line, s_gv_line : unsigned(15 downto 0);
+  signal s_gu_line, s_gv_line : unsigned(11 downto 0);
   signal s_accq_line : unsigned(14 downto 0);
   signal s_cos, s_sin : signed(11 downto 0);
 
   -- M1 / M2
-  signal s_uu, s_vq : signed(18 downto 0);
+  signal s_uu, s_vq : signed(13 downto 0);
   signal s_m1_ok : std_logic;
   signal s_u8, s_v8 : unsigned(7 downto 0);
   signal s_uv_ok : std_logic;
@@ -198,6 +201,7 @@ architecture rtl of cbv_composite_core is
   signal s_wa_y  : unsigned(10 downto 0);
   signal s_wd_y  : unsigned(9 downto 0);
   signal s_wa_uv : unsigned(8 downto 0);
+  signal s_q     : signed(11 downto 0);
   signal s_wd_uv : std_logic_vector(15 downto 0);
   signal s_b     : unsigned(10 downto 0);
   signal s_out_y, s_out_u, s_out_v : unsigned(9 downto 0);
@@ -215,12 +219,12 @@ architecture rtl of cbv_composite_core is
   signal t2_bpk_ld : std_logic;
   -- T3 (stage 16)
   signal t3_y       : signed(15 downto 0);
-  signal t3_c       : signed(15 downto 0);
+  signal t3_cs      : signed(12 downto 0);
   signal t3_comb_en : std_logic;
   signal t3_cr_old  : signed(9 downto 0);
   -- T4 (stage 24, valid on t4_valid)
-  signal t4_u4    : signed(17 downto 0);
-  signal t4_v4    : signed(17 downto 0);
+  signal t4_u4    : signed(14 downto 0);
+  signal t4_v4    : signed(14 downto 0);
   signal t4_valid : std_logic;
   -- T5 (per line, valid on t5_stb)
   signal t5_stb     : std_logic;
@@ -233,8 +237,11 @@ architecture rtl of cbv_composite_core is
   signal t5_apc_int : signed(15 downto 0);
   signal t5_am      : unsigned(36 downto 0);
   signal t5_accq    : unsigned(14 downto 0);
-  signal t5_gu      : unsigned(15 downto 0);
-  signal t5_gv      : unsigned(15 downto 0);
+  signal t5_gu9     : unsigned(11 downto 0);
+  signal t5_gv9     : unsigned(11 downto 0);
+  signal t5_bur     : signed(27 downto 0);    -- bu' (PAL-S lines)
+  signal t5_bvr     : signed(27 downto 0);    -- bv'
+  signal t5_sw_pic  : std_logic;
   signal t5_col_on  : std_logic;
   signal t5_kcnt    : unsigned(10 downto 0);
   signal t5_sw_tv   : std_logic;
@@ -245,6 +252,7 @@ architecture rtl of cbv_composite_core is
   signal t6_yw     : unsigned(9 downto 0);
   signal t6_we_uv  : std_logic;
   signal t6_wa_uv  : unsigned(8 downto 0);
+  signal t6_q      : signed(11 downto 0);
   signal t6_u8     : unsigned(7 downto 0);
   signal t6_v8     : unsigned(7 downto 0);
   signal t6_b      : unsigned(10 downto 0);
@@ -363,8 +371,9 @@ begin
       o_gu_line => s_gu_line, o_gv_line => s_gv_line, o_accq_line => s_accq_line,
       o_t5_stb => t5_stb, o_bsum_u => t5_bsum_u, o_bsum_v => t5_bsum_v, o_mag => t5_mag,
       o_beta => t5_beta, o_ee => t5_ee, o_apc_int => t5_apc_int, o_am => t5_am,
-      o_accq => t5_accq, o_gu => t5_gu, o_gv => t5_gv, o_kcnt => t5_kcnt,
-      o_sw_tv => t5_sw_tv, o_idc => t5_idc);
+      o_accq => t5_accq, o_gu => t5_gu9, o_gv => t5_gv9, o_kcnt => t5_kcnt,
+      o_sw_tv => t5_sw_tv, o_idc => t5_idc, o_bur => t5_bur, o_bvr => t5_bvr,
+      o_sw_pic_r => t5_sw_pic);
   t5_apc_ph <= s_apc_ph;
   t5_col_on <= s_col_on;
 
@@ -385,6 +394,7 @@ begin
       o_cos => s_cos, o_sin => s_sin);
 
   u_m2 : entity work.cbv_m2_gain
+    generic map (G_CODEC_ONLY => G_CODEC_ONLY)
     port map (
       clk => clk, i_uu => s_uu, i_vq => s_vq, i_valid => s_m1_ok, i_sol => s_solp(C_ST_M1),
       i_gu => s_gu_line, i_gv => s_gv_line, i_col_on => s_col_on, i_t9 => s_reg6(2),
@@ -406,7 +416,7 @@ begin
       i_x => dw_x, i_sol => dw_sol, i_tid => dw_tid, i_dh => C_DH0,
       i_raw_y => s_in_y, i_raw_u => s_in_u, i_raw_v => s_in_v,
       o_we_y => s_we_y, o_wa_y => s_wa_y, o_wd_y => s_wd_y,
-      o_we_uv => s_we_uv, o_wa_uv => s_wa_uv, o_wd_uv => s_wd_uv, o_b => s_b);
+      o_we_uv => s_we_uv, o_wa_uv => s_wa_uv, o_q => s_q, o_wd_uv => s_wd_uv, o_b => s_b);
 
   -- ================================================================ Tame buffer + read side (block 12)
   u_tame : entity work.cbv_tame_buffer
@@ -429,12 +439,25 @@ begin
   -- ================================================================ tap wiring
   t1_comp <= s_comp;  t1_m <= s_m_enc;  t1_psi <= s_psi_enc;
   t2_sd <= s_sd;  t2_bpk <= s_bpk;  t2_bpk_ld <= s_bpk_ld;
-  t3_y <= s_y16;  t3_c <= s_c16;  t3_comb_en <= s_comb_en;  t3_cr_old <= s_old;
+  t3_y <= s_y16;  t3_cs <= s_c16;  t3_comb_en <= s_comb_en;  t3_cr_old <= s_old;
   t4_u4 <= s_u4;  t4_v4 <= s_v4;  t4_valid <= s_u4_ok;
   t6_we_y <= s_we_y;  t6_wa_y <= s_wa_y;  t6_yw <= s_wd_y;
-  t6_we_uv <= s_we_uv;  t6_wa_uv <= s_wa_uv;
+  t6_we_uv <= s_we_uv;  t6_wa_uv <= s_wa_uv;  t6_q <= s_q;
   t6_u8 <= unsigned(s_wd_uv(15 downto 8));  t6_v8 <= unsigned(s_wd_uv(7 downto 0));
   t6_b <= s_b;
   t_x_dec <= dd_x;  t_x_yc <= dy_x;  t_x_wr <= dw_x;
+
+  o_taps <= (t1_comp => t1_comp, t1_m => t1_m, t1_psi => t1_psi, x_dec => t_x_dec,
+             t2_sd => t2_sd, t2_bpk => t2_bpk, t2_bpk_ld => t2_bpk_ld, x_yc => t_x_yc,
+             t3_y => t3_y, t3_cs => t3_cs, t3_comb_en => t3_comb_en, t3_cr_old => t3_cr_old,
+             t4_u4 => t4_u4, t4_v4 => t4_v4, t4_valid => t4_valid,
+             t5_stb => t5_stb, t5_bsum_u => t5_bsum_u, t5_bsum_v => t5_bsum_v,
+             t5_bur => t5_bur, t5_bvr => t5_bvr, t5_mag => t5_mag, t5_beta => t5_beta,
+             t5_ee => t5_ee, t5_apc_ph => t5_apc_ph, t5_apc_int => t5_apc_int, t5_am => t5_am,
+             t5_accq => t5_accq, t5_gu9 => t5_gu9, t5_gv9 => t5_gv9, t5_col_on => t5_col_on,
+             t5_kcnt => t5_kcnt, t5_sw_tv => t5_sw_tv, t5_sw_pic => t5_sw_pic, t5_idc => t5_idc,
+             t6_we_y => t6_we_y, t6_wa_y => t6_wa_y, t6_yw => t6_yw, t6_we_uv => t6_we_uv,
+             t6_wa_uv => t6_wa_uv, t6_q => t6_q, t6_u8 => t6_u8, t6_v8 => t6_v8, t6_b => t6_b,
+             x_wr => t_x_wr);
 
 end architecture rtl;

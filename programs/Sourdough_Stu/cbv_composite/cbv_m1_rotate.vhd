@@ -23,15 +23,16 @@
 -- alpha_d = 0 (slider ignored) and theta = 0 (Hue Bend off) in Stage 1, so
 -- phi is latched once per line at this block's x = 0 (R-LATCH; APC result of
 -- line l-1). c = cos(phi), s = sin(phi) from the quarter-wave ROM (s12,
--- 1.0 = 2047; PROVISIONAL Q7), read twice per line through its single port.
---   uu = (U4 c + V4 s) >> 11,  vq = (V4 c - U4 s) >> 11
--- One inferred multiplier (18 x 12), time-shared over the 4 clocks of each /4
--- sample: slots U4*c, V4*s, V4*c, U4*s.
+-- 1.0 = 2047; RULED Q7), read twice per line through its single port.
+--   U4h = U4 >> 1, V4h = V4 >> 1 (RULED Q14)
+--   uu = sat((U4h c + V4h s) >> 10, s14),  vq = sat((V4h c - U4h s) >> 10, s14)
+-- One inferred multiplier (14 x 12: s13 halves + the +4096 guard corner),
+-- time-shared over the 4 clocks of each /4 sample: U4h*c, V4h*s, V4h*c, U4h*s.
 --
 -- Pipeline (e0 = U4 loaded at stage 24): e1-e4 operand registers, e2-e5
 --   products, e3-e6 accumulate, outputs registered at e6 (stage 30). Latency 6.
 -- EBR map #11: sine quarter-wave ROM 256 x 12 -> 1 EBR (256x16).
--- Resources (paper): ~400 LC incl. LUT logic and phase; 1 multiplier.
+-- Resources (paper): ~450 LC incl. LUT logic and phase; 1 multiplier.
 --------------------------------------------------------------------------------
 library ieee;
 use ieee.std_logic_1164.all;
@@ -43,13 +44,13 @@ use work.cbv_pkg.all;
 entity cbv_m1_rotate is
   port (
     clk      : in  std_logic;
-    i_u4     : in  signed(17 downto 0);     -- stage 24
-    i_v4     : in  signed(17 downto 0);
+    i_u4     : in  signed(14 downto 0);     -- stage 24
+    i_v4     : in  signed(14 downto 0);
     i_valid  : in  std_logic;               -- stage 24
     i_sol    : in  std_logic;               -- this block's x = 0 (stage 24)
     i_apc_ph : in  unsigned(17 downto 0);
-    o_uu     : out signed(18 downto 0);     -- stage 30
-    o_vq     : out signed(18 downto 0);
+    o_uu     : out signed(13 downto 0);     -- stage 30 (s14)
+    o_vq     : out signed(13 downto 0);
     o_valid  : out std_logic;
     o_cos    : out signed(11 downto 0);     -- line coefficients (also used by the engine)
     o_sin    : out signed(11 downto 0)
@@ -79,15 +80,15 @@ architecture rtl of cbv_m1_rotate is
 
   -- frame
   signal s_ph    : unsigned(2 downto 0) := (others => '1');
-  signal s_ma    : signed(17 downto 0) := (others => '0');
+  signal s_ma    : signed(13 downto 0) := (others => '0');
   signal s_mb    : signed(11 downto 0) := (others => '0');
   signal s_slot1 : unsigned(2 downto 0) := (others => '1');
-  signal s_prod  : signed(29 downto 0) := (others => '0');
+  signal s_prod  : signed(25 downto 0) := (others => '0');
   signal s_slot2 : unsigned(2 downto 0) := (others => '1');
-  signal s_au    : signed(29 downto 0) := (others => '0');
-  signal s_av    : signed(29 downto 0) := (others => '0');
-  signal s_uu_f  : signed(30 downto 0) := (others => '0');
-  signal s_uu, s_vq : signed(18 downto 0) := (others => '0');
+  signal s_au    : signed(25 downto 0) := (others => '0');
+  signal s_av    : signed(25 downto 0) := (others => '0');
+  signal s_uu_f  : signed(26 downto 0) := (others => '0');
+  signal s_uu, s_vq : signed(13 downto 0) := (others => '0');
   signal s_ov    : std_logic := '0';
 
   -- quarter-wave addressing for sin(p): returns address; neg / one flags
@@ -169,12 +170,12 @@ begin
       -- the next valid can reload them (valid spacing >= 4 clocks)
       s_slot1 <= "111";
       if i_valid = '1' then
-        s_ma <= i_u4; s_mb <= s_cos; s_slot1 <= "000"; s_ph <= "001";
+        s_ma <= resize(shift_right(i_u4, 1), 14); s_mb <= s_cos; s_slot1 <= "000"; s_ph <= "001";
       else
         case to_integer(s_ph) is
-          when 1 => s_ma <= i_v4; s_mb <= s_sin; s_slot1 <= "001"; s_ph <= "010";
-          when 2 => s_ma <= i_v4; s_mb <= s_cos; s_slot1 <= "010"; s_ph <= "011";
-          when 3 => s_ma <= i_u4; s_mb <= s_sin; s_slot1 <= "011"; s_ph <= "111";
+          when 1 => s_ma <= resize(shift_right(i_v4, 1), 14); s_mb <= s_sin; s_slot1 <= "001"; s_ph <= "010";
+          when 2 => s_ma <= resize(shift_right(i_v4, 1), 14); s_mb <= s_cos; s_slot1 <= "010"; s_ph <= "011";
+          when 3 => s_ma <= resize(shift_right(i_u4, 1), 14); s_mb <= s_sin; s_slot1 <= "011"; s_ph <= "111";
           when others => null;
         end case;
       end if;
@@ -185,11 +186,11 @@ begin
       s_ov <= '0';
       case to_integer(s_slot2) is
         when 0 => s_au <= s_prod;
-        when 1 => s_uu_f <= resize(s_au, 31) + resize(s_prod, 31);
+        when 1 => s_uu_f <= resize(s_au, 27) + resize(s_prod, 27);
         when 2 => s_av <= s_prod;
         when 3 =>
-          s_uu <= resize(shift_right(s_uu_f, 11), 19);
-          s_vq <= resize(shift_right(resize(s_av, 31) - resize(s_prod, 31), 11), 19);
+          s_uu <= f_sat(shift_right(s_uu_f, 10), 14);
+          s_vq <= f_sat(shift_right(resize(s_av, 27) - resize(s_prod, 27), 10), 14);
           s_ov <= '1';
         when others => null;
       end case;

@@ -20,13 +20,18 @@
 -- Archer trace. Behavioural model only; no schematic artwork is copied.
 --
 --   md  = ((8/P) x_d + psi_d) mod 8 of the newest notch sample n
---         PROVISIONAL Q4: minus 2 (one quarter cycle) on comb samples, whose
---         chroma is centred at n - h/2.
---   du  = 2c S8[md], dv = 2c C8[md] with H*(2c) (Q8: H applied to 2c,
---         negation after the shift-sum)
+--         RULED Q4 (spec rev 3 §13): minus 2 (one quarter cycle) on comb samples,
+--         whose chroma is centred at n - h/2.
+--   du  = S8[md] applied to 2 cS, dv likewise (RULED Q8: H applied to 2 cS,
+--         negation after the shift-sum). cS is s13 (RULED Q14).
 --   lu, lv : 2 cascaded OP2, k = kc[P], F = 8 (no clear)
---   U4  = (sum of lu over x_d mod 4 = 0..3) >> 2, valid at x_d mod 4 = 3
---         (PROVISIONAL Q3: phase referenced to x_d, not x_d - act0)
+--   U4  = (sum of lu over the 4 tags of a group) >> 2 (RULED Q3): groups by
+--         r = (x_n - act0) mod 4, valid at r = 2 (P=8) / 1 (P=4); a group restarts
+--         at r = valid + 1. (A line wrap at cpl = 2 mod 4 skips the restart
+--         residue: those blanking samples join the next group.)
+--   Widths (RULED Q14 + guard): du/dv, lu/lv, U4/V4 are s14 values except the
+--         single corner +8192 (cS = -4096 negated, md = 6); one guard bit (s15)
+--         keeps that exact, so nothing wraps or saturates.
 --
 -- Pipeline: 16 c | 17 2c, partial H sums | 18 H | 19 du, dv | 20 pre1 |
 --   21 S1 | 22 pre2 | 23 S2 (lu) | 24 U4, V4 (+ valid). Latency 8.
@@ -45,12 +50,12 @@ entity cbv_demod is
     i_x       : in  unsigned(11 downto 0);  -- Y/C domain, stage 13
     i_psi     : in  unsigned(2 downto 0);
     i_tid     : in  t_tid;
-    i_c       : in  signed(15 downto 0);    -- stage 16
+    i_c       : in  signed(12 downto 0);    -- cS, stage 16
     i_comb_en : in  std_logic;              -- stage 16
-    o_du      : out signed(17 downto 0);    -- stage 19
-    o_dv      : out signed(17 downto 0);
-    o_u4      : out signed(17 downto 0);    -- stage 24
-    o_v4      : out signed(17 downto 0);
+    o_du      : out signed(14 downto 0);    -- stage 19
+    o_dv      : out signed(14 downto 0);
+    o_u4      : out signed(14 downto 0);    -- stage 24
+    o_v4      : out signed(14 downto 0);
     o_valid   : out std_logic               -- stage 24: U4/V4 loaded on this clock
   );
 end entity cbv_demod;
@@ -62,24 +67,25 @@ architecture rtl of cbv_demod is
   signal s_mp  : t_m_pipe := (others => (others => '0'));
   signal s_xp  : t_x_pipe := (others => (others => '0'));
   signal s_p8p : t_b_pipe := (others => false);
+  signal s_vr  : t_x_pipe := (others => (others => '0'));   -- valid residue
 
-  signal s_ha17, s_hb17, s_c2_17 : signed(17 downto 0) := (others => '0');
+  signal s_ha17, s_hb17, s_c2_17 : signed(14 downto 0) := (others => '0');
   signal s_md17, s_md18 : unsigned(2 downto 0) := (others => '0');
-  signal s_h18, s_c2_18 : signed(17 downto 0) := (others => '0');
-  signal s_du19, s_dv19 : signed(17 downto 0) := (others => '0');
-  signal s_pu20, s_pv20 : signed(27 downto 0) := (others => '0');
-  signal s_s1u, s_s1v   : signed(27 downto 0) := (others => '0');
-  signal s_pu22, s_pv22 : signed(27 downto 0) := (others => '0');
-  signal s_s2u, s_s2v   : signed(27 downto 0) := (others => '0');
-  signal s_lu23, s_lv23 : signed(19 downto 0);
-  signal s_au, s_av     : signed(21 downto 0) := (others => '0');
-  signal s_u4, s_v4     : signed(17 downto 0) := (others => '0');
+  signal s_h18, s_c2_18 : signed(14 downto 0) := (others => '0');
+  signal s_du19, s_dv19 : signed(14 downto 0) := (others => '0');
+  signal s_pu20, s_pv20 : signed(23 downto 0) := (others => '0');
+  signal s_s1u, s_s1v   : signed(23 downto 0) := (others => '0');
+  signal s_pu22, s_pv22 : signed(23 downto 0) := (others => '0');
+  signal s_s2u, s_s2v   : signed(23 downto 0) := (others => '0');
+  signal s_lu23, s_lv23 : signed(15 downto 0);
+  signal s_au, s_av     : signed(17 downto 0) := (others => '0');
+  signal s_u4, s_v4     : signed(14 downto 0) := (others => '0');
   signal s_valid        : std_logic := '0';
 
   function f_pre(x : signed; p8 : boolean) return signed is
-    variable v : signed(27 downto 0);
+    variable v : signed(23 downto 0);
   begin
-    v := resize(x, 28);
+    v := resize(x, 24);
     if p8 then
       return shift_left(v, 6) - v;                    -- a = 2, b = 8
     else
@@ -102,8 +108,8 @@ begin
     variable f    : t_fmt;
     variable v_m  : unsigned(2 downto 0);
     variable v_md : unsigned(2 downto 0);
-    variable v_cv : signed(17 downto 0);
-    variable v_sum_u, v_sum_v : signed(21 downto 0);
+    variable v_cv : signed(14 downto 0);
+    variable v_sum_u, v_sum_v : signed(17 downto 0);
   begin
     if rising_edge(clk) then
       f := f_fmt(i_tid);
@@ -115,10 +121,12 @@ begin
       end if;
       s_mp(14) <= v_m;
       s_mp(15 to 16) <= s_mp(14 to 15);
-      s_xp(14) <= i_x(1 downto 0);
+      s_xp(14) <= i_x(1 downto 0) - to_unsigned(f.act0 mod 4, 2);   -- (x_n - act0) mod 4
+      s_vr(14) <= to_unsigned(f.r4v, 2);
       s_xp(15 to 23) <= s_xp(14 to 22);
       s_p8p(14) <= f.p8;
       s_p8p(15 to 23) <= s_p8p(14 to 22);
+      s_vr(15 to 23) <= s_vr(14 to 22);
 
       -- stage 17: 2c and partial H(2c) = c + c>>2 + c>>3 + c>>5
       if i_comb_en = '1' then
@@ -127,9 +135,9 @@ begin
         v_md := s_mp(16);
       end if;
       s_md17  <= v_md;
-      s_c2_17 <= shift_left(resize(i_c, 18), 1);
-      s_ha17  <= resize(i_c, 18) + resize(shift_right(i_c, 2), 18);
-      s_hb17  <= resize(shift_right(i_c, 3), 18) + resize(shift_right(i_c, 5), 18);
+      s_c2_17 <= shift_left(resize(i_c, 15), 1);
+      s_ha17  <= resize(i_c, 15) + resize(shift_right(i_c, 2), 15);
+      s_hb17  <= resize(shift_right(i_c, 3), 15) + resize(shift_right(i_c, 5), 15);
       -- stage 18
       s_h18   <= s_ha17 + s_hb17;
       s_c2_18 <= s_c2_17;
@@ -159,19 +167,19 @@ begin
       s_pv22 <= f_pre(shift_right(s_s1v, 8), s_p8p(21));
       s_s2u  <= f_step(s_s2u, s_pu22, s_p8p(22));
       s_s2v  <= f_step(s_s2v, s_pv22, s_p8p(22));
-      -- stage 24: /4 integrate-and-dump on x_d mod 4
-      v_sum_u := s_au + resize(s_lu23, 22);
-      v_sum_v := s_av + resize(s_lv23, 22);
-      if s_xp(23) = "00" then
-        s_au <= resize(s_lu23, 22);
-        s_av <= resize(s_lv23, 22);
+      -- stage 24: /4 integrate-and-dump on (x_n - act0) mod 4 (RULED Q3)
+      v_sum_u := s_au + resize(s_lu23, 18);
+      v_sum_v := s_av + resize(s_lv23, 18);
+      if s_xp(23) = s_vr(23) + 1 then
+        s_au <= resize(s_lu23, 18);
+        s_av <= resize(s_lv23, 18);
       else
         s_au <= v_sum_u;
         s_av <= v_sum_v;
       end if;
-      if s_xp(23) = "11" then
-        s_u4    <= resize(shift_right(v_sum_u, 2), 18);
-        s_v4    <= resize(shift_right(v_sum_v, 2), 18);
+      if s_xp(23) = s_vr(23) then
+        s_u4    <= resize(shift_right(v_sum_u, 2), 15);
+        s_v4    <= resize(shift_right(v_sum_v, 2), 15);
         s_valid <= '1';
       else
         s_valid <= '0';
@@ -179,8 +187,8 @@ begin
     end if;
   end process;
 
-  s_lu23 <= resize(shift_right(s_s2u, 8), 20);
-  s_lv23 <= resize(shift_right(s_s2v, 8), 20);
+  s_lu23 <= resize(shift_right(s_s2u, 8), 16);
+  s_lv23 <= resize(shift_right(s_s2v, 8), 16);
 
   o_du    <= s_du19;
   o_dv    <= s_dv19;

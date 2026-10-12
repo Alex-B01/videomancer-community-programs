@@ -23,7 +23,7 @@
 -- sample of the line with hb >= CA and sums exactly 2^CLS samples of o;
 -- BP = sum >> CLS; BPk = (BP*61) >> 6 (Porch) or (BP*77) >> 6 (Picture,
 -- CA_in / CLS_in; T11 is tied to Porch in Stage 1). sd = o - BPk; BPk holds
--- until the next window. PROVISIONAL Q10: the window's own samples use the
+-- until the next window. RULED Q10 (spec rev 3 §13): the window's own samples use the
 -- previous BPk; the new BPk applies from the first sample after the window.
 --
 -- Pipeline: 10 o, decoder domain (x_d) | 11 window sum | 12 BP | 13 BPk, sd.

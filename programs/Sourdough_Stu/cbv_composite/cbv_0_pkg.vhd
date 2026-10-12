@@ -80,15 +80,72 @@ package cbv_pkg is
     sd_v2    : natural;      -- cpl/2
     sd_v3    : natural;      -- cpl - hs
     hd_v     : natural;      -- floor(0.85 cpl)
-    thr      : natural;      -- killer threshold floor(MREF/10)       (PROVISIONAL Q13)
-    thr_hi   : natural;      -- (thr * 1149) >> 10                    (PROVISIONAL Q13)
+    thr      : natural;      -- killer threshold floor(MREF/10)       (RULED Q13, spec rev 3 §13)
+    thr_hi   : natural;      -- (thr * 1149) >> 10                    (RULED Q13)
     mref20   : natural;      -- floor(MREF/20)
-    woff_uv  : natural;      -- chroma write offset h/2 + YE           (PROVISIONAL Q2)
+    kq       : natural;      -- UV word offset: q = (x - act0 - kq)/4, 10 (P=8) / 5 (P=4) (RULED Q2)
+    r4v      : natural;      -- /4 valid residue (x - act0) mod 4: 2 (P=8) / 1 (P=4)       (RULED Q3)
   end record;
 
   function f_fmt(tid : t_tid) return t_fmt;
 
-  -- quarter-wave sine, T[k] = round(2047 sin(2 pi k / 1024)), k = 0..255   (PROVISIONAL Q7)
+  -- Gate-2 tap bundle (spec-stage1 §6 T1-T6), driven by cbv_composite_core's
+  -- o_taps port. program_top leaves it open, so synthesis removes it. (A port,
+  -- because this GHDL 6.0-dev build cannot read VHDL-2008 external names.)
+  type t_cbv_taps is record
+    -- T1, stage 10 (luma tag = decoder domain x at stage 10)
+    t1_comp    : signed(13 downto 0);
+    t1_m       : unsigned(2 downto 0);
+    t1_psi     : unsigned(2 downto 0);
+    x_dec      : unsigned(11 downto 0);
+    -- T2, stage 13
+    t2_sd      : signed(15 downto 0);
+    t2_bpk     : signed(15 downto 0);
+    t2_bpk_ld  : std_logic;
+    x_yc       : unsigned(11 downto 0);   -- tag n.x at stage 13
+    -- T3, stage 16
+    t3_y       : signed(15 downto 0);
+    t3_cs      : signed(12 downto 0);
+    t3_comb_en : std_logic;
+    t3_cr_old  : signed(9 downto 0);
+    -- T4, on t4_valid
+    t4_u4      : signed(14 downto 0);
+    t4_v4      : signed(14 downto 0);
+    t4_valid   : std_logic;
+    -- T5, per line on t5_stb
+    t5_stb     : std_logic;
+    t5_bsum_u  : signed(19 downto 0);
+    t5_bsum_v  : signed(19 downto 0);
+    t5_bur     : signed(27 downto 0);
+    t5_bvr     : signed(27 downto 0);
+    t5_mag     : unsigned(23 downto 0);
+    t5_beta    : unsigned(17 downto 0);
+    t5_ee      : signed(17 downto 0);
+    t5_apc_ph  : unsigned(17 downto 0);
+    t5_apc_int : signed(15 downto 0);
+    t5_am      : unsigned(36 downto 0);
+    t5_accq    : unsigned(14 downto 0);
+    t5_gu9     : unsigned(11 downto 0);
+    t5_gv9     : unsigned(11 downto 0);
+    t5_col_on  : std_logic;
+    t5_kcnt    : unsigned(10 downto 0);
+    t5_sw_tv   : std_logic;
+    t5_sw_pic  : std_logic;
+    t5_idc     : unsigned(2 downto 0);
+    -- T6, write-port registers
+    t6_we_y    : std_logic;
+    t6_wa_y    : unsigned(10 downto 0);
+    t6_yw      : unsigned(9 downto 0);
+    t6_we_uv   : std_logic;
+    t6_wa_uv   : unsigned(8 downto 0);
+    t6_q       : signed(11 downto 0);
+    t6_u8      : unsigned(7 downto 0);
+    t6_v8      : unsigned(7 downto 0);
+    t6_b       : unsigned(10 downto 0);
+    x_wr       : unsigned(11 downto 0);   -- write-domain tag x (stage 35)
+  end record;
+
+  -- quarter-wave sine, T[k] = round(2047 sin(2 pi k / 1024)), k = 0..255   (RULED Q7, spec rev 3 §13)
   type t_sin_rom is array (0 to 255) of integer range 0 to 2047;
   constant C_SIN_Q : t_sin_rom := (
     0,13,25,38,50,63,75,88,100,113,126,138,151,163,176,188,201,213,226,238,251,263,275,288,
@@ -106,7 +163,7 @@ package cbv_pkg is
     2027,2028,2030,2032,2033,2035,2036,2037,2038,2039,2040,2041,2042,2043,2044,2045,2045,2046,
     2046,2046,2047,2047,2047);
 
-  -- CORDIC A_i = round(atan(2^-i) / (2 pi) * 2^18), i = 0..11        (PROVISIONAL Q6)
+  -- CORDIC A_i = round(atan(2^-i) / (2 pi) * 2^18), i = 0..11        (RULED Q6, spec rev 3 §13)
   type t_atan is array (0 to 11) of integer;
   constant C_ATAN : t_atan := (32768, 19344, 10221, 5188, 2604, 1303, 652, 326, 163, 81, 41, 20);
 
@@ -127,12 +184,17 @@ package cbv_pkg is
   constant C_SYNC_SD   : integer := -410;
   constant C_SYNC_HD   : integer := 430;
   constant C_KNEE_T    : integer := 716;
-  constant C_GU_FINAL  : integer := 4242;  -- x8/7 x0.90625
+  constant C_GU_FINAL  : integer := 4242;  -- x8/7 x0.90625 (gU9 = (ACCq K) >> 15)
   constant C_GV_FINAL  : integer := 3007;  -- x0.81013 x0.90625
   constant C_GU_CODEC  : integer := 4681;
   constant C_GV_CODEC  : integer := 3318;
   constant C_ACCQ_MAX  : integer := 16384;
   constant C_ACCQ_RST  : integer := 4096;
+  -- gU9 / gV9 reset = (4096 K) >> 15
+  constant C_GU9_FINAL : integer := 530;
+  constant C_GV9_FINAL : integer := 375;
+  constant C_GU9_CODEC : integer := 585;
+  constant C_GV9_CODEC : integer := 414;
 
   -- pipeline stage numbers (clock index; stage 1 = input register). The
   -- "newest-sample tag" at stage s is the luma-tag input sample delayed
@@ -193,7 +255,7 @@ package body cbv_pkg is
     r.thr      := mref / 10;
     r.thr_hi   := (r.thr * 1149) / 1024;
     r.mref20   := mref / 20;
-    r.woff_uv  := r.h2 + r.ye;
+    if r.p8 then r.kq := 10; r.r4v := 2; else r.kq := 5; r.r4v := 1; end if;
     return r;
   end function;
 

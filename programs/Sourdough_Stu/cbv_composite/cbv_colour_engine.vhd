@@ -19,33 +19,33 @@
 -- Credits: Syntonie CBV001 Rev C schematic (CC BY-SA 4.0), Phil Baljeu's
 -- Archer trace. Behavioural model only; no schematic artwork is copied.
 --
--- Burst gate (keyed at the Y/C domain, stage 13, newest notch sample; Q9):
---   opens at the first sample of the line with hb = x_d + dh_l >= bst +
---   burst_off + 1 (burst_off = 0, dh_l = 0 in Stage 1) and lasts blen samples;
+-- Burst gate (keyed on tag n, the newest notch sample, Y/C domain stage 13;
+--   RULED Q9, spec rev 3 §13): opens at the first sample of the line with
+--   n.x + dh_l >= bst + burst_off + P/4 (burst_off = 0, dh_l = 0 in Stage 1)
+--   and lasts blen samples;
 --   no gate on a line with vline = 1; a gate sample with AVID = 1 adds 0
 --   (inhibit). Bsum_u/v = sum du/dv (sat s20), aligned at stage 19.
 --   sw_tv toggles at each gate start when T9 = PAL-S; sw_pic = the value
---   after this line's toggle, used for the picture (Q12).
+--   after this line's toggle, used for the picture (RULED Q12).
 -- Serial engine after the gate closes (one line's work, ~75 clk):
 --   PAL-S: (bu', bv') = ((Bu c + Bv s) >> 11, (Bv c - Bu s) >> 11) with c, s =
---          cos/sin(phi_g) from M1 (bit-serial multiply; Q6), CORDIC on
+--          cos/sin(phi_g) from M1 (bit-serial multiply; RULED Q6), CORDIC on
 --          (-bu', |bv'|): ee = atan - 128; ident on bv' sw_tv.
---   NTSC : CORDIC on (Bu, Bv): beta; ee = wrap(phi_g + 512 - beta) (Q5: the
---          spec's wrap(beta - phi_g - 512) has the sign that makes the APC
---          diverge with APC_ph -= kp ee; flagged).
+--   NTSC : CORDIC on (Bu, Bv): beta; ee = wrap(Phi_g + 131072 - beta) (RULED Q5).
 --   CORDIC: x < 0 -> pre-rotate by 1/2 cycle; 12 vectoring iterations,
 --          y >= 0 -> rotate -atan(2^-i); mag = x (gain 1.64676), beta = z
---          (1/1024 cycle, 8 fraction bits). (Q6)
+--          (1/1024 cycle, 8 fraction bits). (RULED Q6)
 --   APC  : if mag > floor(MREF/20): apc_int = sat(apc_int + (ee>>11) + (ee>>13),
 --          +-33.0), APC_ph -= (ee>>5) + (ee>>9); then APC_ph -= apc_int (mod 1024.0)
 --   ACC  : d = mag<<13 - am; am += (d>>10) - (d>>13) (F = 13; reset MREF)
 --   Killer: thr = floor(MREF/10); on: count lines am < thr; off: am > (thr*1149)>>10;
---          count > 1000 toggles col_on (Q13)
+--          count > 1000 toggles col_on (RULED Q13)
 --   Divider: ACCq = min(16384, floor(MREF*4096/am)), restoring, 14 iterations
---          after the saturation test; gU/gV = (ACCq*K)>>12 (bit-serial)
+--          after the saturation test; gU9/gV9 = (ACCq*K)>>15, u12 (bit-serial, RULED Q14)
 -- Result timing (R-LATCH, §2.2): APC_ph, col_on, ident apply from line l+1
 -- (consumers latch at their own x = 0); ACCq / gU / gV from line l apply from
 -- l+2 (two-stage register at the Y/C-domain x = 0, consumers latch after).
+-- am reloads MREF*2^13 on the first run and on a timing-ID change (ruled).
 -- Resources (paper): ~490 LC (CORDIC shifters dominate), no EBR, no `*`.
 --------------------------------------------------------------------------------
 library ieee;
@@ -70,8 +70,8 @@ entity cbv_colour_engine is
     i_t9       : in  std_logic;
     i_dh       : in  signed(11 downto 0);    -- dh_l (0 in Stage 1)
     -- demod, stage 19
-    i_du       : in  signed(17 downto 0);
-    i_dv       : in  signed(17 downto 0);
+    i_du       : in  signed(14 downto 0);
+    i_dv       : in  signed(14 downto 0);
     -- M1 line coefficients (cos/sin of phi_g, s12, 1.0 = 2047)
     i_cos      : in  signed(11 downto 0);
     i_sin      : in  signed(11 downto 0);
@@ -79,8 +79,8 @@ entity cbv_colour_engine is
     o_apc_ph   : out unsigned(17 downto 0);  -- 10.8, 1/1024 cycle
     o_col_on   : out std_logic;
     o_sw_pic   : out std_logic;              -- '1' = sw_tv -1 for this line's picture
-    o_gu_line  : out unsigned(15 downto 0);
-    o_gv_line  : out unsigned(15 downto 0);
+    o_gu_line  : out unsigned(11 downto 0);   -- gU9
+    o_gv_line  : out unsigned(11 downto 0);   -- gV9
     o_accq_line: out unsigned(14 downto 0);
     -- T5 per-line record (valid on o_t5_stb)
     o_t5_stb   : out std_logic;
@@ -92,8 +92,11 @@ entity cbv_colour_engine is
     o_apc_int  : out signed(15 downto 0);
     o_am       : out unsigned(36 downto 0);
     o_accq     : out unsigned(14 downto 0);
-    o_gu       : out unsigned(15 downto 0);
-    o_gv       : out unsigned(15 downto 0);
+    o_gu       : out unsigned(11 downto 0);
+    o_gv       : out unsigned(11 downto 0);
+    o_bur      : out signed(27 downto 0);    -- bu' (PAL-S lines)
+    o_bvr      : out signed(27 downto 0);    -- bv'
+    o_sw_pic_r : out std_logic;
     o_kcnt     : out unsigned(10 downto 0);
     o_sw_tv    : out std_logic;              -- '1' = -1
     o_idc      : out unsigned(2 downto 0)
@@ -112,6 +115,8 @@ architecture rtl of cbv_colour_engine is
   end function;
   constant C_KU : integer := f_ku;
   constant C_KV : integer := f_kv;
+  constant C_GU0 : integer := (C_ACCQ_RST * C_KU) / 32768;   -- 530 / 585
+  constant C_GV0 : integer := (C_ACCQ_RST * C_KV) / 32768;   -- 375 / 414
 
   -- gate (stage 13 -> 19)
   signal s_armed  : std_logic := '0';
@@ -163,8 +168,9 @@ architecture rtl of cbv_colour_engine is
   signal s_q        : unsigned(14 downto 0) := to_unsigned(C_ACCQ_RST, 15);
   -- results for l+1 / l+2 staging
   signal s_accq_res, s_accq_prev, s_accq_line : unsigned(14 downto 0) := to_unsigned(C_ACCQ_RST, 15);
-  signal s_gu_res, s_gu_prev, s_gu_line : unsigned(15 downto 0) := to_unsigned(C_KU, 16);
-  signal s_gv_res, s_gv_prev, s_gv_line : unsigned(15 downto 0) := to_unsigned(C_KV, 16);
+  signal s_gu_res, s_gu_prev, s_gu_line : unsigned(11 downto 0) := to_unsigned(C_GU0, 12);
+  signal s_gv_res, s_gv_prev, s_gv_line : unsigned(11 downto 0) := to_unsigned(C_GV0, 12);
+  signal s_bur      : signed(27 downto 0) := (others => '0');
   signal s_stb      : std_logic := '0';
 
   -- one bit-serial step: P := (P_hi +- a) & P_lo, then P := P sra 1
@@ -209,7 +215,7 @@ begin
           v_last := '1';
         end if;
         s_armed <= v_arm;
-      elsif v_arm = '1' and v_hb >= f.bst + 1 then
+      elsif v_arm = '1' and v_hb >= f.bst + f.h2 then
         s_armed <= '0';
         if i_vline = '0' then
           v_open := '1'; v_act := '1';
@@ -335,6 +341,7 @@ begin
           v_rot := resize(s_p1, 40) + resize(s_pa, 40);
           v_rot := shift_right(v_rot, 11);
           s_cx  <= -resize(v_rot, 24);                         -- -bu'
+          s_bur <= resize(v_rot, 28);
           v_rot := resize(s_p2, 40) - resize(s_pb, 40);
           v_rot := shift_right(v_rot, 11);
           s_bvr <= resize(v_rot, 28);
@@ -477,8 +484,8 @@ begin
 
         when ST_DONE =>
           s_accq_res <= s_q;
-          s_gu_res   <= unsigned(resize(shift_right(s_pa, 12), 16));
-          s_gv_res   <= unsigned(resize(shift_right(s_pb, 12), 16));
+          s_gu_res   <= unsigned(resize(shift_right(s_pa, 15), 12));
+          s_gv_res   <= unsigned(resize(shift_right(s_pb, 15), 12));
           s_stb      <= '1';
           s_st       <= ST_IDLE;
       end case;
@@ -506,5 +513,8 @@ begin
   o_kcnt    <= s_kcnt;
   o_sw_tv   <= s_sw_tv;
   o_idc     <= s_idc;
+  o_bur     <= s_bur;
+  o_bvr     <= s_bvr;
+  o_sw_pic_r <= s_sw_pic;
 
 end architecture rtl;

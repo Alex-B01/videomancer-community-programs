@@ -25,16 +25,17 @@
 --   The luma is delayed so that it reaches the write register together
 --   with U4/V4's results (spec §5.10 "aligned at the write").
 -- Write side (rolling base, spec §1.3), write domain = stage 35 newest tag x_w:
---   B   : B <- (B + S) mod 2048 at every write-domain line start (B_0 = 0)
+--   B   : B <- (B + S) mod 2048 at every write-domain line start (B_0 = 0);
+--         the x = 0 sample already uses the new B (RULED Q11)
 --   Y   : p = x_w - h/2 - act0 (notch-centred luma); we = 0 <= p < actw on
 --         every line; address (B + p) mod 2048
---   U/V : at each /4 result (x_w mod 4 = 3): p = x_w - (h/2 + YE) - act0
---         (chroma group-delay compensation, PROVISIONAL Q2); we = 0 <= p < actw;
---         address (B/4 + p >> 2) mod 512; word (U8, V8)
+--   U/V : at each U4-valid tag ((x_w - act0) mod 4 = 2 / 1): word index
+--         q = (x_w - act0 - kq)/4, kq = 10 (P=8) / 5 (P=4), exact (RULED Q2);
+--         we = 0 <= q < actw/4; address (B/4 + q) mod 512; word (U8, V8)
 --   dh_l = 0 in Stage 1 (port reserved).
 -- G_LOOPBACK (H2): the write data are the raw input aligned to the write
---   stage: Y of the input sample at the luma position; U/V (truncated to 8 b)
---   of the input sample at p = 4 q (the word's own position).
+--   stage: Y of the input sample at the luma position; U/V = (Ucode >> 2,
+--   Vcode >> 2) of the input sample at 4 q + act0.
 -- Pipeline: 16 y | 17 ya, yb | 18 yg | 19 e, KN | 20 dk | 21 dk*f | 22 knee |
 --   23 sat -> delay -> 35 | 36 write registers (T6). RAM write on the next edge.
 -- Resources (paper): ~160 LC + luma delay ~120 FF; no EBR (RAMs in cbv_tame_buffer).
@@ -72,8 +73,9 @@ entity cbv_output is
     o_wd_y   : out unsigned(9 downto 0);
     o_we_uv  : out std_logic;
     o_wa_uv  : out unsigned(8 downto 0);
+    o_q      : out signed(11 downto 0);              -- UV word index q (T6)
     o_wd_uv  : out std_logic_vector(15 downto 0);   -- U8 & V8
-    o_b      : out unsigned(10 downto 0)            -- write base B of the current write line
+    o_b      : out unsigned(10 downto 0)            -- write base B used by the stage-36 sample
   );
 end entity cbv_output;
 
@@ -94,6 +96,8 @@ architecture rtl of cbv_output is
   signal s_yw23 : unsigned(9 downto 0) := (others => '0');
 
   signal s_b    : unsigned(10 downto 0) := (others => '0');
+  signal s_b36  : unsigned(10 downto 0) := (others => '0');
+  signal s_q36  : signed(11 downto 0) := (others => '0');
   signal s_we_y, s_we_uv : std_logic := '0';
   signal s_wa_y  : unsigned(10 downto 0) := (others => '0');
   signal s_wd_y  : unsigned(9 downto 0) := (others => '0');
@@ -166,24 +170,26 @@ begin
     variable v_pu  : signed(13 downto 0);
     variable v_yd  : unsigned(9 downto 0);
     variable v_uvd : std_logic_vector(15 downto 0);
-    variable v_j   : natural range 0 to 3;
     variable v_r   : std_logic_vector(29 downto 0);
-    variable v_luma_codec : unsigned(9 downto 0);
+    variable v_b   : unsigned(10 downto 0);
   begin
     if rising_edge(clk) then
       f := f_fmt(i_tid);
       if i_sol = '1' then
-        s_b <= s_b + to_unsigned(f.s, 11);
+        v_b := s_b + to_unsigned(f.s, 11);
+        s_b <= v_b;
+      else
+        v_b := s_b;
       end if;
+      s_b36 <= v_b;
       v_py := resize(signed('0' & i_x), 14) - to_signed(f.h2 + f.act0, 14) + resize(i_dh, 14);
-      v_pu := resize(signed('0' & i_x), 14) - to_signed(f.woff_uv + f.act0, 14) + resize(i_dh, 14);
+      v_pu := resize(signed('0' & i_x), 14) - to_signed(f.kq + f.act0, 14) + resize(i_dh, 14);
       v_yd := s_ydly(C_YDLY);
       v_uvd := std_logic_vector(i_u8) & std_logic_vector(i_v8);
       if G_LOOPBACK then
         v_r := s_raw(34 + f.ye + f.h2);
         v_yd := unsigned(v_r(29 downto 20));
-        v_j := to_integer(unsigned(v_pu(1 downto 0)));
-        v_r := s_raw(34 + f.ye + f.woff_uv + v_j);
+        v_r := s_raw(34 + f.ye + f.kq);
         v_uvd := v_r(19 downto 12) & v_r(9 downto 2);
       end if;
       -- Y
@@ -192,7 +198,7 @@ begin
       else
         s_we_y <= '0';
       end if;
-      s_wa_y <= s_b + unsigned(v_py(10 downto 0));
+      s_wa_y <= v_b + unsigned(v_py(10 downto 0));
       s_wd_y <= v_yd;
       -- U/V
       if i_uv_ok = '1' and v_pu >= 0 and v_pu < f.actw then
@@ -200,11 +206,12 @@ begin
       else
         s_we_uv <= '0';
       end if;
-      s_wa_uv <= s_b(10 downto 2) + unsigned(v_pu(10 downto 2));
+      s_wa_uv <= v_b(10 downto 2) + unsigned(v_pu(10 downto 2));
+      s_q36   <= resize(shift_right(v_pu, 2), 12);
       s_wd_uv <= v_uvd;
       -- pragma translate_off
-      assert not (i_uv_ok = '1' and i_x(1 downto 0) /= "11")
-        report "cbv_output: /4 result not on x_w mod 4 = 3" severity warning;
+      assert not (i_uv_ok = '1' and v_pu(1 downto 0) /= "00" and i_x /= x"FFF")
+        report "cbv_output: /4 result not on a U4-valid tag" severity warning;
       -- pragma translate_on
     end if;
   end process;
@@ -225,6 +232,7 @@ begin
   o_we_uv <= s_we_uv;
   o_wa_uv <= s_wa_uv;
   o_wd_uv <= s_wd_uv;
-  o_b     <= s_b;
+  o_b     <= s_b36;
+  o_q     <= s_q36;
 
 end architecture rtl;

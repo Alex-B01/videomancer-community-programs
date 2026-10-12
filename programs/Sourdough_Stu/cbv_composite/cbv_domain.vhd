@@ -32,8 +32,8 @@
 --            3 lines before; holds until the next x = bst
 --   aline  : active line index in field (saturates at 3): reset at the vsync_n
 --            fall, +1 at each line start after a line that carried AVID
--- Convention (PROVISIONAL Q11): an update made at x = 0 applies to the line
--- that starts at that x = 0 (sample x = 0 already sees the new psi / lp / tid).
+-- Convention (RULED Q11, spec rev 3 §13): an update made at x = 0 applies to the
+-- line that starts at that x = 0 (sample x = 0 already sees the new psi / lp / tid).
 -- Latency: 1 clock (all outputs aligned with the registered sample).
 -- Resources: ~35 LC, no EBR.
 --------------------------------------------------------------------------------

@@ -29,16 +29,15 @@
 -- read and write of one address returns the old word.
 --
 -- Read side (input domain; spec §1.1 boundary stages):
---   RB  : latched from the write base B at the input-domain line start
---         (the line start sample itself still uses the previous RB; x = 0 is
---         never inside the active window)
+--   RB  : RB <- B_prev (the write base in use) at the input-domain line start;
+--         the x = 0 sample already uses the new RB (RULED Q11)
 --   2   Y addr = (RB + x - act0) mod 2048;
 --       UV addr = (RB/4 + ((x - act0) >> 2) + 1) mod 512 (one word ahead, so
 --       the single read port delivers next; cur = the word read one sample
 --       earlier), f = (x - act0) & 3
 --   3   EBR read   4 EBR output register (+ previous word)
 --   5   interp 1: at f = 0 latch cur, d = next - cur
---   6   interp 2: U10 = 4 cur + d f (= cur10 + (d10 f) >> 2 exactly; PROVISIONAL Q15)
+--   6   interp 2: U10 = 4 cur + d f (= cur10 + (d10 f) >> 2 exactly; RULED Q15)
 --   7   R1 clamp Y 64..940, U/V 64..960
 --   8   AVID gate (Y 64, U = V = 512) + output register
 -- Resources (paper): ~175 LC; 7 EBR.
@@ -136,16 +135,20 @@ begin
     variable v_cu, v_cv : signed(9 downto 0);
     variable v_u, v_v   : signed(11 downto 0);
     variable v_y   : unsigned(9 downto 0);
+    variable v_rb  : unsigned(10 downto 0);
   begin
     if rising_edge(clk) then
       f := f_fmt(i_tid);
       if i_sol = '1' then
+        v_rb := i_b;
         s_rb <= i_b;
+      else
+        v_rb := s_rb;
       end if;
       -- stage 2: addresses
       v_p := resize(signed('0' & i_x), 14) - to_signed(f.act0, 14);
-      s_ra_y  <= s_rb + unsigned(v_p(10 downto 0));
-      s_ra_uv <= s_rb(10 downto 2) + unsigned(v_p(10 downto 2)) + 1;
+      s_ra_y  <= v_rb + unsigned(v_p(10 downto 0));
+      s_ra_uv <= v_rb(10 downto 2) + unsigned(v_p(10 downto 2)) + 1;
       s_f2    <= unsigned(v_p(1 downto 0));
       -- stage 3 (EBR read in p_y_rd / p_uv_rd)
       s_f3 <= s_f2;

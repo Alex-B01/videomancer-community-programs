@@ -25,9 +25,10 @@
 --           pointer p (mod LAG, +1 per written word), read-before-write:
 --           yC = (sd[c] + 2 old) >> 1, cC = (sd[c] - 2 old) >> 1
 --   comb_en = AVID(c) and col_on and aline >= LAG/actw and not(1080 and T8=PAL)
---   y = col_on ? (comb_en ? yC : yN) : sd[c];   c = comb_en ? cC : cN
---   PROVISIONAL Q16: AVID of the centred sample c gates comb write/enable;
---   col_on / T8 latch at the Y/C-domain x = 0 of the newest sample (Q9).
+--   y = col_on ? (comb_en ? yC : yN) : sd[c];   cS = sat(comb_en ? cC : cN, s13)
+--   RULED Q16 (spec rev 3 §13): AVID of the centred sample c gates comb write/enable;
+--   col_on / T8 latch at the Y/C-domain x = 0 of the newest sample (RULED Q9).
+--   cS = sat(c_out, -4096, 4095) (s13, RULED Q14).
 --
 -- Comb RAM (EBR map #8): bank A 2048 x 10 (5 EBR, 2048x2 each) for p < 2048,
 --   bank B 512 x 10 (2 EBR, 512x8 each) for 2048 <= p < 2560. Total 7 EBR,
@@ -56,7 +57,7 @@ entity cbv_ycsplit is
     i_t8      : in  std_logic;              -- latched at the domain's x = 0
     i_col_on  : in  std_logic;              -- colour engine (live)
     o_y       : out signed(15 downto 0);    -- stage 16
-    o_c       : out signed(15 downto 0);
+    o_c       : out signed(12 downto 0);    -- cS (s13)
     o_comb_en : out std_logic;
     o_old     : out signed(9 downto 0);     -- cR_old (comb RAM read word)
     o_col_on  : out std_logic               -- col_on as used on this sample
@@ -86,7 +87,8 @@ architecture rtl of cbv_ycsplit is
   signal s_ce15, s_col15 : std_logic := '0';
   signal s_old15 : signed(9 downto 0);
   -- stage 16
-  signal s_y16, s_c16 : signed(15 downto 0) := (others => '0');
+  signal s_y16 : signed(15 downto 0) := (others => '0');
+  signal s_c16 : signed(12 downto 0) := (others => '0');
   signal s_ce16, s_col16 : std_logic := '0';
   signal s_old16 : signed(9 downto 0) := (others => '0');
 begin
@@ -155,9 +157,9 @@ begin
         s_y16 <= s_sdc15;
       end if;
       if s_ce15 = '1' then
-        s_c16 <= resize(shift_right(resize(s_sdc15, 18) - shift_left(resize(s_old15, 18), 1), 1), 16);
+        s_c16 <= f_sat(shift_right(resize(s_sdc15, 18) - shift_left(resize(s_old15, 18), 1), 1), 13);
       else
-        s_c16 <= s_cn15;
+        s_c16 <= f_sat(s_cn15, 13);
       end if;
       s_ce16  <= s_ce15;
       s_col16 <= s_col15;

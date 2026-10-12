@@ -21,7 +21,7 @@
 --
 -- Y,U,V -> comp (cv, s14; white 0.714 V = 1024).
 --
--- Two sample streams meet at the modulator (PROVISIONAL Q1):
+-- Two sample streams meet at the modulator (RULED Q1, spec rev 3 §13):
 --   chroma : the input sample stream (stage 1) through Us/Vs + 2 OP2 poles
 --            -> Uf, Vf at stage 6 ("5 (poles)").
 --   luma   : the luma-tag stream = input delayed YE more (cbv_composite_core
@@ -37,10 +37,10 @@
 --   5  pole 2 pre    (X = S1 >> 8)
 --   6  pole 2 S      -> Uf = S2 >> 8 ; encoder domain registers (luma tag)
 --   7  H*Uf, H*Vf ; m, sw, burst window, SYNC level from the domain
---   8  S8[m]*Uf, sw*C8[m]*Vf selected (negation after the H shift-sum, Q8)
+--   8  S8[m]*Uf, sw*C8[m]*Vf selected (negation after the H shift-sum, RULED Q8)
 --   9  C = burst ? BURST[m] : (gateE ? tU + tV : 0)
 --   10 comp = sat14(Yd + C + SYNC)                    -> o_comp
---   kc: P=4 7/16 (a=1, b=4); P=8 63/256 (a=2, b=8); F = 8 as tabled (Q17).
+--   kc: P=4 7/16 (a=1, b=4); P=8 63/256 (a=2, b=8); F = 8 (RULED Q17: §5.1 rule is F >= a + 3).
 -- Latency: chroma stage 1 -> comp 9 clocks (luma-tag stage 1 -> comp 9).
 -- Resources (paper): (a) ~320 LC, (b) ~160 LC (luma tag chain is in the core).
 -- No EBR, no multipliers.

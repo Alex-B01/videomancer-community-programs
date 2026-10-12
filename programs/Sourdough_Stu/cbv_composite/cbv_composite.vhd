@@ -34,7 +34,7 @@
 --   Y/C split, demodulator, burst-locked colour engine) into a one-line
 --   "Tame" buffer that is read out on the true raster one line late.
 --
---   STATUS: Stage 1 (codec round trip). The CBV001 cell is an identity stub
+--   STATUS: Stage 1 (codec round trip), spec rev 3 (rulings Q1-Q17 applied). The CBV001 cell is an identity stub
 --   (cbv_cell_stub.vhd), the sync side (separator, AFC, Tame) is absent
 --   (dh_l = 0), Hue Bend and the colour slider are off. Not a usable
 --   instrument yet. Stage plan: plans/cbv_composite/spec.md (rev 2) and
@@ -71,7 +71,7 @@
 --
 -- LC estimate (spec-stage1.md §4): program ~3,730 paper / ~3,250 packed;
 --   full design on sd_dual ~5,000 (range 4,400-5,700). Two inferred
---   multipliers (M1 18x12, M2 19x17); no multiplier_s.
+--   multipliers (M1 14x12, M2 14x13, spec rev 3 Q14); no multiplier_s.
 --
 -- Register map (full control map in cbv_composite.toml; Stage 1 reads only):
 --   Tog 8  (registers_in(6)(1)) : Encode  NTSC / PAL
@@ -109,7 +109,8 @@ begin
       registers_in      => registers_in,
       data_in           => data_in,
       data_out          => data_out,
-      i_test_burst_gain => '1'
+      i_test_burst_gain => '1',
+      o_taps            => open
     );
 
 end architecture cbv_composite;
