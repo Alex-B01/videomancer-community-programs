@@ -251,7 +251,8 @@ begin
       s_yl(2 to 5) <= s_yl(1 to 4);
     end if;
   end process;
-  s_lt0   <= s_ye(C_YE);                    -- input delayed YE (bitstream constant)
+  s_lt0   <= s_ye(maximum(C_YE, 1)) when C_YE > 0      -- input delayed YE (bitstream constant)
+             else di.hs & di.vs & di.avid & std_logic_vector(s_in_y);   -- mono: YE = 0
   s_fl(1) <= s_lt0(12 downto 10);
   s_yl(1) <= unsigned(s_lt0(9 downto 0));
 
@@ -372,49 +373,112 @@ begin
     generic map (G_W => 15, G_D => C_ST_UV8 - 1 - C_ST_CLAMP, G_EBR => C_DELAY_EBR, G_INIT => x"0006")
     port map (clk => clk, i_d => w_d4_i, o_d => w_d4_o);
 
-  -- ================================================================ Y/C (stage 53)
-  u_dom_yc : entity work.cbv_domain
-    port map (clk => clk, i_hs_n => s_flc(C_ST_SD - 1)(2), i_vs_n => s_flc(C_ST_SD - 1)(1),
-              i_avid => s_flc(C_ST_SD - 1)(0), i_tid => s_tid, i_reg6 => s_reg6,
-              o_hs_n => dy.hs, o_vs_n => dy.vs, o_avid => dy.avid, o_x => dy.x, o_sol => dy.sol,
-              o_psi => dy.psi, o_lp => dy.lp, o_tid => dy.tid, o_reg6 => dy.reg6,
-              o_vline => dy.vline, o_aline => dy.aline, o_a0m => dy.a0m);
+  -- ================================================================ colour decode chain (not mono)
+  g_col : if not C_MONO generate
+    -- ================================================================ Y/C (stage 53)
+    u_dom_yc : entity work.cbv_domain
+      port map (clk => clk, i_hs_n => s_flc(C_ST_SD - 1)(2), i_vs_n => s_flc(C_ST_SD - 1)(1),
+                i_avid => s_flc(C_ST_SD - 1)(0), i_tid => s_tid, i_reg6 => s_reg6,
+                o_hs_n => dy.hs, o_vs_n => dy.vs, o_avid => dy.avid, o_x => dy.x, o_sol => dy.sol,
+                o_psi => dy.psi, o_lp => dy.lp, o_tid => dy.tid, o_reg6 => dy.reg6,
+                o_vline => dy.vline, o_aline => dy.aline, o_a0m => dy.a0m);
 
-  u_yc : entity work.cbv_ycsplit
-    port map (clk => clk, i_sd => s_sd, i_avid => dy.avid, i_sol => dy.sol, i_aline => dy.aline,
-              i_tid => dy.tid, i_t8 => dy.reg6(1), i_col_on => s_col_on,
-              o_y => s_y, o_c => s_cs, o_comb_en => s_comb_en, o_old => s_old, o_col_on => s_col_yc);
+    u_yc : entity work.cbv_ycsplit
+      port map (clk => clk, i_sd => s_sd, i_avid => dy.avid, i_sol => dy.sol, i_aline => dy.aline,
+                i_tid => dy.tid, i_t8 => dy.reg6(1), i_col_on => s_col_on,
+                o_y => s_y, o_c => s_cs, o_comb_en => s_comb_en, o_old => s_old, o_col_on => s_col_yc);
 
-  -- ================================================================ slider, demod, colour
-  u_sl : entity work.cbv_slider
-    port map (clk => clk, i_sol_in => di.sol, i_tid_in => di.tid, i_s12 => registers_in(7),
-              i_sol_yc => dy.sol, o_boff => s_boff, o_dm => s_dm, o_da => s_da);
+    -- ================================================================ slider, demod, colour
+    u_sl : entity work.cbv_slider
+      port map (clk => clk, i_sol_in => di.sol, i_tid_in => di.tid, i_s12 => registers_in(7),
+                i_sol_yc => dy.sol, o_boff => s_boff, o_dm => s_dm, o_da => s_da);
 
-  u_demod : entity work.cbv_demod
-    port map (clk => clk, i_x => dy.x, i_a0m => dy.a0m, i_psi => dy.psi, i_sol => dy.sol,
-              i_c => s_cs, i_comb_en => s_comb_en, i_dm => s_dm,
-              o_md => s_md, o_du => s_du, o_dv => s_dv, o_strobe => s_stb4, o_i4u => s_i4u, o_i4v => s_i4v,
-              o_commit => s_cmt, o_pin_u => s_pin_u, o_pin_v => s_pin_v,
-              o_u4 => s_u4, o_v4 => s_v4, o_valid => s_u4_ok);
+    u_demod : entity work.cbv_demod
+      port map (clk => clk, i_x => dy.x, i_a0m => dy.a0m, i_psi => dy.psi, i_sol => dy.sol,
+                i_c => s_cs, i_comb_en => s_comb_en, i_dm => s_dm,
+                o_md => s_md, o_du => s_du, o_dv => s_dv, o_strobe => s_stb4, o_i4u => s_i4u, o_i4v => s_i4v,
+                o_commit => s_cmt, o_pin_u => s_pin_u, o_pin_v => s_pin_v,
+                o_u4 => s_u4, o_v4 => s_v4, o_valid => s_u4_ok);
 
-  p_solp : process(clk)
+    p_solp : process(clk)
+    begin
+      if rising_edge(clk) then
+        s_solp(C_ST_SD + 1) <= dy.sol;
+        s_solp(C_ST_SD + 2 to C_ST_U4) <= s_solp(C_ST_SD + 1 to C_ST_U4 - 1);
+      end if;
+    end process;
+
+    u_col : entity work.cbv_colour
+      generic map (G_CODEC_ONLY => G_CODEC_ONLY)
+      port map (clk => clk, i_x => dy.x, i_sol => dy.sol, i_vline => dy.vline, i_avid => dy.avid,
+                i_lp => dy.lp, i_tid => dy.tid, i_t9 => dy.reg6(2), i_dh => s_dhp(C_ST_SD), i_boff => s_boff,
+                i_du => s_du, i_dv => s_dv, i_u4 => s_u4, i_v4 => s_v4, i_valid => s_u4_ok,
+                i_sol4 => s_solp(C_ST_U4), i_t9r => s_reg6(2),
+                o_col_on => s_col_on, o_u8 => s_u8, o_v8 => s_v8, o_valid => s_uv_ok,
+                o_t5_stb => t5_stb, o_bu => t5_bu, o_bv => t5_bv, o_mag => t5_mag, o_am => t5_am,
+                o_accq => t5_accq, o_gu9 => t5_gu9, o_gv9 => t5_gv9, o_codes => t5_codes,
+                o_kcnt => t5_kcnt, o_sw_tv => t5_sw_tv, o_sw_pic => t5_sw_pic, o_idc => t5_idc);
+
+
+  end generate;
+
+  -- ================================================================ G_MONO path
+  -- luma = clamped composite sd; col_on = 1; input U/V bypass the virtual TV:
+  -- /4 integrate-and-dump on the input domain (same strobe rule as the demod:
+  -- (x - a0_m) mod 4 = r_P, Acc never reset at the wrap), U8 = sat((I4 >> 2) + 128),
+  -- carried to the write domain by delay line D5 and written at the U4-valid tag
+  -- with q = (x - a0_m - r_P)/4, the luma's rolling base and dh_l >> 2.
+  g_mono : if C_MONO generate
+    signal s_au, s_av : signed(13 downto 0) := (others => '0');
+    signal s_mu8, s_mv8 : unsigned(7 downto 0) := to_unsigned(128, 8);
+    signal w_d5_i, w_d5_o : std_logic_vector(15 downto 0);
+    function f_u8(z : signed(13 downto 0)) return unsigned is
+      variable v : signed(13 downto 0);
+    begin
+      v := shift_right(z, 2) + 128;
+      if v < 0 then return to_unsigned(0, 8);
+      elsif v > 255 then return to_unsigned(255, 8);
+      else return unsigned(v(7 downto 0)); end if;
+    end function;
   begin
-    if rising_edge(clk) then
-      s_solp(C_ST_SD + 1) <= dy.sol;
-      s_solp(C_ST_SD + 2 to C_ST_U4) <= s_solp(C_ST_SD + 1 to C_ST_U4 - 1);
-    end if;
-  end process;
-
-  u_col : entity work.cbv_colour
-    generic map (G_CODEC_ONLY => G_CODEC_ONLY)
-    port map (clk => clk, i_x => dy.x, i_sol => dy.sol, i_vline => dy.vline, i_avid => dy.avid,
-              i_lp => dy.lp, i_tid => dy.tid, i_t9 => dy.reg6(2), i_dh => s_dhp(C_ST_SD), i_boff => s_boff,
-              i_du => s_du, i_dv => s_dv, i_u4 => s_u4, i_v4 => s_v4, i_valid => s_u4_ok,
-              i_sol4 => s_solp(C_ST_U4), i_t9r => s_reg6(2),
-              o_col_on => s_col_on, o_u8 => s_u8, o_v8 => s_v8, o_valid => s_uv_ok,
-              o_t5_stb => t5_stb, o_bu => t5_bu, o_bv => t5_bv, o_mag => t5_mag, o_am => t5_am,
-              o_accq => t5_accq, o_gu9 => t5_gu9, o_gv9 => t5_gv9, o_codes => t5_codes,
-              o_kcnt => t5_kcnt, o_sw_tv => t5_sw_tv, o_sw_pic => t5_sw_pic, o_idc => t5_idc);
+    p_mid : process(clk)
+      variable v_u, v_v : signed(13 downto 0);
+    begin
+      if rising_edge(clk) then
+        if di.avid = '1' then
+          v_u := s_au + (resize(signed('0' & s_in_u), 14) - 512);
+          v_v := s_av + (resize(signed('0' & s_in_v), 14) - 512);
+        else
+          v_u := s_au; v_v := s_av;
+        end if;
+        if di.x(1 downto 0) - di.a0m(1 downto 0) = to_unsigned(C_R4V, 2) then
+          s_mu8 <= f_u8(shift_right(v_u, 2));
+          s_mv8 <= f_u8(shift_right(v_v, 2));
+          s_au <= (others => '0'); s_av <= (others => '0');
+        else
+          s_au <= v_u; s_av <= v_v;
+        end if;
+      end if;
+    end process;
+    w_d5_i <= std_logic_vector(s_mu8) & std_logic_vector(s_mv8);
+    u_d5 : entity work.cbv_delay
+      generic map (G_W => 16, G_D => C_ST_UV8 - 2, G_EBR => C_DELAY_EBR, G_INIT => x"8080")
+      port map (clk => clk, i_d => w_d5_i, o_d => w_d5_o);
+    s_u8    <= unsigned(w_d5_o(15 downto 8));
+    s_v8    <= unsigned(w_d5_o(7 downto 0));
+    s_uv_ok <= '1' when dw.x(1 downto 0) - dw.a0m(1 downto 0) = to_unsigned(C_R4V, 2) else '0';
+    s_y      <= s_sd;
+    s_col_on <= '1';
+    s_cs <= (others => '0'); s_comb_en <= '0'; s_old <= (others => '0'); s_col_yc <= '1';
+    s_md <= (others => '0'); s_du <= (others => '0'); s_dv <= (others => '0');
+    s_i4u <= (others => '0'); s_i4v <= (others => '0'); s_stb4 <= '0'; s_cmt <= '0';
+    s_pin_u <= (others => '0'); s_pin_v <= (others => '0'); s_u4 <= (others => '0'); s_v4 <= (others => '0');
+    s_u4_ok <= '0'; s_dm <= (others => '0'); s_da <= (others => '0'); s_boff <= (others => '0');
+    t5_stb <= '0'; t5_bu <= (others => '0'); t5_bv <= (others => '0'); t5_mag <= (others => '0');
+    t5_am <= (others => '0'); t5_accq <= (others => '0'); t5_gu9 <= (others => '0'); t5_gv9 <= (others => '0');
+    t5_codes <= (others => '0'); t5_kcnt <= (others => '0'); t5_sw_tv <= '0'; t5_sw_pic <= '0';
+    t5_idc <= (others => '0');
+  end generate;
 
   -- ================================================================ write domain + output
   u_dom_wr : entity work.cbv_domain

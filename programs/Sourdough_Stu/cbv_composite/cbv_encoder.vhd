@@ -48,6 +48,9 @@
 --   m_c = ((8/P) x + psi + sgn kh) mod 8 (chroma), m_b = ((8/P) x + psi) mod 8 (burst)
 -- Colour-leak source (§5.5, G5): cm = max(|Uf|,|Vf|) + (min >> 1), sat 2047, 0
 --   when gateE = 0; col = (cm 410) >> 10 at stage 8 (0 when C_COLOUR_LEAK = false).
+-- C_MONO: luma-only composite comp = sat(Yd + SYNC): no chroma poles, carrier,
+--   burst or Hue Bend; YE = 0, so the luma tag is the input sample; the leak's
+--   cm = |Uc| + |Vc| of that input sample (0 outside AVID), sat 2047.
 -- Latency: chroma stage 1 -> comp 9 clocks (luma-tag stage 1 -> comp 9).
 -- Resources (paper): (a) ~320 LC, (b) ~160 LC (luma tag chain is in the core).
 -- No EBR, no multipliers.
@@ -100,6 +103,8 @@ architecture rtl of cbv_encoder is
   signal s_kh7, s_kh8, s_kh9, s_kh10 : unsigned(2 downto 0) := (others => '0');
   signal s_p5   : unsigned(5 downto 0) := (others => '0');
   signal s_cm7  : unsigned(10 downto 0) := (others => '0');
+  type t_mcm is array (2 to 6) of unsigned(10 downto 0);
+  signal s_mcm  : t_mcm := (others => (others => '0'));
   signal s_col8 : unsigned(9 downto 0) := (others => '0');
   signal s_gate         : std_logic_vector(2 to 9) := (others => '0');
   signal s_uf6, s_vf6   : signed(13 downto 0);
@@ -158,13 +163,13 @@ begin
     port map (clk => clk, i_x => s_us2, i_sel => '0', i_clr => s_sol2, o_s => open, o_y => s_y1u);
   u_p1v : entity work.cbv_op2s generic map (G_WX => 12, G_WS => 20, G_F => 8, G_K0 => C_KC, G_K1 => C_KC)
     port map (clk => clk, i_x => s_vs2, i_sel => '0', i_clr => s_sol2, o_s => open, o_y => s_y1v);
-  g_2pole : if not C_ENC_1POLE generate
+  g_2pole : if not C_ENC_1POLE and not C_MONO generate
     u_p2u : entity work.cbv_op2s generic map (G_WX => 12, G_WS => 20, G_F => 8, G_K0 => C_KC, G_K1 => C_KC)
       port map (clk => clk, i_x => s_y1u, i_sel => '0', i_clr => s_sol4, o_s => open, o_y => s_y2u);
     u_p2v : entity work.cbv_op2s generic map (G_WX => 12, G_WS => 20, G_F => 8, G_K0 => C_KC, G_K1 => C_KC)
       port map (clk => clk, i_x => s_y1v, i_sel => '0', i_clr => s_sol4, o_s => open, o_y => s_y2v);
   end generate;
-  g_1pole : if C_ENC_1POLE generate     -- G3: one pole, pipelined 2 to stage 6
+  g_1pole : if C_ENC_1POLE and not C_MONO generate     -- G3: one pole, pipelined 2 to stage 6
     p_d2 : process(clk)
     begin
       if rising_edge(clk) then
@@ -174,8 +179,25 @@ begin
     end process;
   end generate;
 
-  s_uf6 <= resize(s_y2u, 14);
-  s_vf6 <= resize(s_y2v, 14);
+  s_uf6 <= resize(s_y2u, 14) when not C_MONO else (others => '0');
+  s_vf6 <= resize(s_y2v, 14) when not C_MONO else (others => '0');
+
+  -- mono colour-leak source: |Uc| + |Vc| of the input sample, carried 2 -> 7
+  g_mcm : if C_MONO generate
+    p_mcm : process(clk)
+      variable v_u, v_v : signed(11 downto 0);
+    begin
+      if rising_edge(clk) then
+        if i_avid = '1' then
+          v_u := resize(signed('0' & i_u) - 512, 12); v_v := resize(signed('0' & i_v) - 512, 12);
+        else
+          v_u := (others => '0'); v_v := (others => '0');
+        end if;
+        s_mcm(2) <= resize(unsigned(abs(v_u)), 11) + resize(unsigned(abs(v_v)), 11);
+        s_mcm(3 to 6) <= s_mcm(2 to 5);
+      end if;
+    end process;
+  end generate;
 
   -- H*Uf = (Uf>>1 + Uf>>3) + (Uf>>4 + Uf>>6), 2-operand adds
   s_hu_a <= shift_right(s_uf6, 1) + shift_right(s_uf6, 3);
@@ -221,7 +243,7 @@ begin
       else
         v_p5 := s_p5;
       end if;
-      if d_avid = '1' then
+      if d_avid = '1' and not C_MONO then
         v_kh := resize(shift_right(v_p5 * s_y6(9 downto 3), 10), 3);
       else
         v_kh := (others => '0');
@@ -238,7 +260,11 @@ begin
       v_av := unsigned(abs(resize(s_vf6, 15)));
       if v_au >= v_av then v_cm := resize(v_au, 16) + resize(shift_right(v_av, 1), 16);
       else v_cm := resize(v_av, 16) + resize(shift_right(v_au, 1), 16); end if;
-      if s_gate(6) = '0' or not C_COLOUR_LEAK then
+      if not C_COLOUR_LEAK then
+        s_cm7 <= (others => '0');
+      elsif C_MONO then
+        s_cm7 <= s_mcm(6);
+      elsif s_gate(6) = '0' then
         s_cm7 <= (others => '0');
       elsif v_cm > 2047 then
         s_cm7 <= to_unsigned(2047, 11);
@@ -254,7 +280,7 @@ begin
       s_t8_7 <= d_reg6(1);
       s_sw7  <= d_reg6(1) and d_lp;  -- sw = -1 iff T8 = PAL and LP = 1
       v_x := to_integer(d_x);
-      if v_x >= f.bst and v_x < f.bst + f.blen and d_vline = '0' then
+      if v_x >= f.bst and v_x < f.bst + f.blen and d_vline = '0' and not C_MONO then
         s_bf7 <= '1';
       else
         s_bf7 <= '0';

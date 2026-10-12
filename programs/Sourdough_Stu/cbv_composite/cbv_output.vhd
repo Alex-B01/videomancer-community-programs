@@ -50,7 +50,7 @@ entity cbv_output is
   );
   port (
     clk      : in  std_logic;
-    i_y      : in  signed(15 downto 0);     -- stage C_ST_YC
+    i_y      : in  signed(15 downto 0);     -- stage C_ST_YL (y; mono: sd)
     i_u8     : in  unsigned(7 downto 0);    -- stage C_ST_UV8
     i_v8     : in  unsigned(7 downto 0);
     i_uv_ok  : in  std_logic;
@@ -77,8 +77,8 @@ entity cbv_output is
 end entity cbv_output;
 
 architecture rtl of cbv_output is
-  constant C_YDLY : natural := C_ST_UV8 - (C_ST_YC + 8);
-  type t_ydly is array (1 to C_YDLY) of unsigned(9 downto 0);
+  constant C_YDLY : natural := C_ST_UV8 - (C_ST_YL + 8);    -- 0 in mono
+  type t_ydly is array (1 to maximum(C_YDLY, 2)) of unsigned(9 downto 0);
   signal s_ydly : t_ydly := (others => (others => '0'));
 
   signal s_y17, s_ya17, s_yb17 : signed(15 downto 0) := (others => '0');
@@ -155,7 +155,9 @@ begin
       s_yw24 <= s_yw23;
       -- delay 25 .. 36
       s_ydly(1) <= s_yw24;
-      s_ydly(2 to C_YDLY) <= s_ydly(1 to C_YDLY - 1);
+      if C_YDLY > 1 then
+        s_ydly(2 to maximum(C_YDLY, 2)) <= s_ydly(1 to maximum(C_YDLY, 2) - 1);
+      end if;
     end if;
   end process;
 
@@ -179,14 +181,14 @@ begin
       end if;
       s_b36 <= v_b;
       -- p, q relative to the measured active start a0_m; dh_l offsets the address only
-      v_py := resize(signed('0' & i_x), 14) - resize(signed('0' & i_a0m), 14) - C_H2;
-      v_pu := resize(signed('0' & i_x), 14) - resize(signed('0' & i_a0m), 14) - C_KQ;
-      v_yd := s_ydly(C_YDLY);
+      v_py := resize(signed('0' & i_x), 14) - resize(signed('0' & i_a0m), 14) - C_H2Y;
+      v_pu := resize(signed('0' & i_x), 14) - resize(signed('0' & i_a0m), 14) - C_KQW;
+      if C_YDLY = 0 then v_yd := s_yw24; else v_yd := s_ydly(maximum(C_YDLY, 1)); end if;
       v_uvd := std_logic_vector(i_u8) & std_logic_vector(i_v8);
       if G_LOOPBACK then
-        v_r := s_raw(C_ST_UV8 - 1 + C_YE + C_H2);
+        v_r := s_raw(C_ST_UV8 - 1 + C_YE + C_H2Y);
         v_yd := unsigned(v_r(29 downto 20));
-        v_r := s_raw(C_ST_UV8 - 1 + C_YE + C_KQ);
+        v_r := s_raw(C_ST_UV8 - 1 + C_YE + C_KQW);
         v_uvd := v_r(19 downto 12) & v_r(9 downto 2);
       end if;
       -- Y

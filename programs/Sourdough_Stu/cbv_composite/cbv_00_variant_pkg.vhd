@@ -36,6 +36,10 @@ package cbv_variant_pkg is
   constant C_AC_PER_SAMPLE : boolean := false;  -- G6: k_in / k_out as per-sample OP2 instead of OP2L
   constant C_DELAY_EBR     : boolean := true;   -- false: every delay line as flip-flops (measures §3.1)
   constant C_ENH_INTERP    : boolean := false;  -- Enhance: false = nearest point (spec), true = interpolated (+~283 LC)
+  -- G_MONO (measurement variant, not yet spec'd): luma-only virtual composite; no
+  -- Y/C, demod or colour decode; input U/V (/4 average) bypass the virtual TV and are
+  -- written with the luma's rolling address and displacement; colour leak = |U|+|V|.
+  constant C_MONO          : boolean := false;
   -- test only (defaults of the core generics G_CODEC_ONLY / G_LOOPBACK)
   constant C_CODEC_ONLY    : boolean := false;
   constant C_LOOPBACK      : boolean := false;

@@ -44,10 +44,14 @@ package cbv_pkg is
   constant C_HD  : boolean := C_ENABLE_HD;          -- HD bitstream: P = 8, tri-level sync
   constant C_P8  : boolean := C_HD;
   constant C_H2  : natural := 2 - boolean'pos(not C_HD);           -- h/2 = P/4: 2 / 1
-  constant C_YE  : natural := (3 + 3 * boolean'pos(C_HD)) * (1 - boolean'pos(C_ENC_1POLE))
-                              + (2 + boolean'pos(C_HD)) * boolean'pos(C_ENC_1POLE);  -- 6 / 3 (G3: 3 / 2)
+  constant C_YE  : natural := ((3 + 3 * boolean'pos(C_HD)) * (1 - boolean'pos(C_ENC_1POLE))
+                              + (2 + boolean'pos(C_HD)) * boolean'pos(C_ENC_1POLE))
+                              * (1 - boolean'pos(C_MONO));        -- 6 / 3 (G3: 3 / 2; mono: 0)
   constant C_KQ  : natural := 5 + 5 * boolean'pos(C_HD);           -- UV word offset 10 / 5 (Q2)
   constant C_R4V : natural := 1 + boolean'pos(C_HD);               -- /4 strobe residue 2 / 1 (Q3)
+  -- write offsets: luma p = x - C_H2Y - a0_m; chroma q = (x - a0_m - C_KQW)/4
+  constant C_H2Y : natural := C_H2 * (1 - boolean'pos(C_MONO));    -- mono: no notch centring
+  constant C_KQW : natural := C_KQ * (1 - boolean'pos(C_MONO)) + C_R4V * boolean'pos(C_MONO);
 
   -- format classes (spec §2.3)
   constant C_CLS_SD   : natural := 0;
@@ -159,7 +163,9 @@ package cbv_pkg is
   constant C_ST_DU    : natural := C_ST_YC + 3;          -- du, dv; gate accumulation input
   constant C_ST_I4    : natural := C_ST_DU + 1;          -- I4 strobe (T4)
   constant C_ST_U4    : natural := C_ST_I4 + 8;          -- U4, V4 from the /4 poles (commit + 4 slots)
-  constant C_ST_UV8   : natural := C_ST_U4 + 6;          -- U8/V8 strobe, write domain
+  constant C_ST_YL    : natural := C_ST_SD + 3 * (1 - boolean'pos(C_MONO));   -- luma into the output (y | mono: sd)
+  constant C_ST_UV8   : natural := (C_ST_U4 + 6) * (1 - boolean'pos(C_MONO))
+                                   + (C_ST_YL + 8) * boolean'pos(C_MONO);  -- U8/V8 strobe, write domain
   constant C_ST_WR    : natural := C_ST_UV8 + 1;         -- write-port registers (T6), L_w
 
 
