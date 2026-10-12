@@ -26,11 +26,13 @@
 -- 1.0 = 2047; RULED Q7), read twice per line through its single port.
 --   U4h = U4 >> 1, V4h = V4 >> 1 (RULED Q14)
 --   uu = sat((U4h c + V4h s) >> 10, s14),  vq = sat((V4h c - U4h s) >> 10, s14)
--- One inferred multiplier (14 x 12: s13 halves + the +4096 guard corner),
+-- One 14 x 12 multiply built as two inferred 14 x 6 halves (s13 halves + guard),
 -- time-shared over the 4 clocks of each /4 sample: U4h*c, V4h*s, V4h*c, U4h*s.
 --
 -- Pipeline (e0 = U4 loaded at stage 24): e1-e4 operand registers, e2-e5
---   products, e3-e6 accumulate, outputs registered at e6 (stage 30). Latency 6.
+--   half products (14 x 6, registered), e3-e6 product sums, e4-e7 accumulate;
+--   uu registered at e5 (stage 29, o_uvalid), vq at e7 (stage 31, o_valid).
+--   Latency 5 / 7 (the split multiplier closes timing; write side only).
 -- EBR map #11: sine quarter-wave ROM 256 x 12 -> 1 EBR (256x16).
 -- Resources (paper): ~450 LC incl. LUT logic and phase; 1 multiplier.
 --------------------------------------------------------------------------------
@@ -49,9 +51,10 @@ entity cbv_m1_rotate is
     i_valid  : in  std_logic;               -- stage 24
     i_sol    : in  std_logic;               -- this block's x = 0 (stage 24)
     i_apc_ph : in  unsigned(17 downto 0);
-    o_uu     : out signed(13 downto 0);     -- stage 30 (s14)
+    o_uu     : out signed(13 downto 0);     -- s14
     o_vq     : out signed(13 downto 0);
-    o_valid  : out std_logic;
+    o_valid  : out std_logic;               -- vq ready (stage 31)
+    o_uvalid : out std_logic;               -- uu ready (stage 29)
     o_cos    : out signed(11 downto 0);     -- line coefficients (also used by the engine)
     o_sin    : out signed(11 downto 0)
   );
@@ -83,11 +86,14 @@ architecture rtl of cbv_m1_rotate is
   signal s_ma    : signed(13 downto 0) := (others => '0');
   signal s_mb    : signed(11 downto 0) := (others => '0');
   signal s_slot1 : unsigned(2 downto 0) := (others => '1');
+  signal s_pph   : signed(19 downto 0) := (others => '0');   -- a * b[11:6]
+  signal s_ppl   : signed(20 downto 0) := (others => '0');   -- a * b[5:0]
+  signal s_slotA : unsigned(2 downto 0) := (others => '1');
   signal s_prod  : signed(25 downto 0) := (others => '0');
   signal s_slot2 : unsigned(2 downto 0) := (others => '1');
   signal s_au    : signed(25 downto 0) := (others => '0');
   signal s_av    : signed(25 downto 0) := (others => '0');
-  signal s_uu_f  : signed(26 downto 0) := (others => '0');
+  signal s_ouv   : std_logic := '0';
   signal s_uu, s_vq : signed(13 downto 0) := (others => '0');
   signal s_ov    : std_logic := '0';
 
@@ -179,17 +185,23 @@ begin
           when others => null;
         end case;
       end if;
-      -- product (e2..e5)
-      s_prod  <= s_ma * s_mb;
-      s_slot2 <= s_slot1;
+      -- product, two registered 14 x 6 halves (e2..e5), then their sum (e3..e6):
+      -- a*b = (a * b[11:6]) << 6 + a * b[5:0]  (exact)
+      s_pph   <= s_ma * s_mb(11 downto 6);
+      s_ppl   <= s_ma * signed('0' & s_mb(5 downto 0));
+      s_slotA <= s_slot1;
+      s_prod  <= shift_left(resize(s_pph, 26), 6) + resize(s_ppl, 26);
+      s_slot2 <= s_slotA;
       -- accumulate (e3..e6); outputs registered with the last slot (e6 = stage 30)
-      s_ov <= '0';
+      s_ov  <= '0';
+      s_ouv <= '0';
       case to_integer(s_slot2) is
         when 0 => s_au <= s_prod;
-        when 1 => s_uu_f <= resize(s_au, 27) + resize(s_prod, 27);
+        when 1 =>
+          s_uu  <= f_sat(shift_right(resize(s_au, 27) + resize(s_prod, 27), 10), 14);
+          s_ouv <= '1';
         when 2 => s_av <= s_prod;
         when 3 =>
-          s_uu <= f_sat(shift_right(s_uu_f, 10), 14);
           s_vq <= f_sat(shift_right(resize(s_av, 27) - resize(s_prod, 27), 10), 14);
           s_ov <= '1';
         when others => null;
@@ -200,6 +212,7 @@ begin
   o_uu    <= s_uu;
   o_vq    <= s_vq;
   o_valid <= s_ov;
+  o_uvalid <= s_ouv;
   o_cos   <= s_cos;
   o_sin   <= s_sin;
 

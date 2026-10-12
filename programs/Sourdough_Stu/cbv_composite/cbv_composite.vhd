@@ -47,7 +47,7 @@
 --     8 AVID gate + output register.
 --   Sync/AVID/field: one 8-deep chain, data_out.avid = tap 8.
 --   Content lands one line late (Tame buffer, rolling base, spec §1.3); the
---   write side (L_w = 36 clocks, cbv_composite_core.vhd stage table) does not
+--   write side (L_w = 37 clocks, cbv_composite_core.vhd stage table) does not
 --   enter the boundary number.
 --
 -- Files (one entity per block of spec-stage1.md §1):
@@ -69,9 +69,9 @@
 -- EBR map (physical): comb RAM 5 + 2, Tame Y 5, Tame UV 2, sine ROM 1 =
 --   15 program EBR (16 on dual configs with the core's dual_sync_delay).
 --
--- LC estimate (spec-stage1.md §4): program ~3,730 paper / ~3,250 packed;
---   full design on sd_dual ~5,000 (range 4,400-5,700). Two inferred
---   multipliers (M1 14x12, M2 14x13, spec rev 3 Q14); no multiplier_s.
+-- LC: see cbv_composite_core.vhd (measured per block). Two inferred
+--   multiplier blocks (M1 14x12 as two 14x6 halves, M2 14x7 digit-serial,
+--   spec rev 3 Q14); no multiplier_s.
 --
 -- Register map (full control map in cbv_composite.toml; Stage 1 reads only):
 --   Tog 8  (registers_in(6)(1)) : Encode  NTSC / PAL

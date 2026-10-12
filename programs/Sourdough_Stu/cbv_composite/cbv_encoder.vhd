@@ -79,14 +79,13 @@ end entity cbv_encoder;
 architecture rtl of cbv_encoder is
   -- chroma
   signal s_us2, s_vs2   : signed(11 downto 0) := (others => '0');
-  signal s_pu3, s_pv3   : signed(21 downto 0) := (others => '0');
-  signal s_s1u, s_s1v   : signed(21 downto 0) := (others => '0');
-  signal s_pu5, s_pv5   : signed(21 downto 0) := (others => '0');
-  signal s_s2u, s_s2v   : signed(21 downto 0) := (others => '0');
-  signal s_sol2, s_sol3, s_sol4, s_sol5 : std_logic := '0';
-  signal s_p8_2, s_p8_3, s_p8_4, s_p8_5 : boolean := false;
+  signal s_sol2, s_sol3, s_sol4 : std_logic := '0';
+  signal s_p8_2, s_p8_3, s_p8_4 : boolean := false;
+  signal s_y1u, s_y1v   : signed(11 downto 0);
+  signal s_y2u, s_y2v   : signed(11 downto 0);
   signal s_gate         : std_logic_vector(2 to 9) := (others => '0');
   signal s_uf6, s_vf6   : signed(13 downto 0);
+  signal s_hu_a, s_hu_b, s_hv_a, s_hv_b : signed(13 downto 0);
   -- encoder domain (stage 6)
   signal d_hs, d_vs, d_avid, d_sol, d_lp, d_vline : std_logic;
   signal d_x            : unsigned(11 downto 0);
@@ -105,30 +104,10 @@ architecture rtl of cbv_encoder is
   signal s_sync7, s_sync8, s_sync9 : signed(10 downto 0) := (others => '0');
   signal s_yd7, s_yd8, s_yd9 : unsigned(9 downto 0) := (others => '0');
   signal s_tu8, s_tv8   : signed(13 downto 0) := (others => '0');
+  signal s_su8          : std_logic := '0';
   signal s_bv8          : signed(8 downto 0) := (others => '0');
   signal s_c9           : signed(13 downto 0) := (others => '0');
   signal s_comp10       : signed(13 downto 0) := (others => '0');
-
-  -- OP2 with kc[P], F = 8: pre = (X<<8)>>a - (X<<8)>>b (exact for F >= b)
-  function f_pre(x : signed; p8 : boolean) return signed is
-    variable v : signed(21 downto 0);
-  begin
-    v := resize(x, 22);
-    if p8 then  -- a = 2, b = 8: X*64 - X
-      return shift_left(v, 6) - v;
-    else        -- a = 1, b = 4: X*128 - X*16
-      return shift_left(v, 7) - shift_left(v, 4);
-    end if;
-  end function;
-
-  function f_step(s : signed; pre : signed; p8 : boolean) return signed is
-  begin
-    if p8 then
-      return s - shift_right(s, 2) + shift_right(s, 8) + pre;
-    else
-      return s - shift_right(s, 1) + shift_right(s, 4) + pre;
-    end if;
-  end function;
 
 begin
 
@@ -150,40 +129,32 @@ begin
       s_sol2 <= i_sol;
       s_p8_2 <= i_p8;
       s_gate(2) <= i_avid;
-      -- stage 3
-      s_pu3  <= f_pre(s_us2, s_p8_2);
-      s_pv3  <= f_pre(s_vs2, s_p8_2);
-      s_sol3 <= s_sol2;
-      s_p8_3 <= s_p8_2;
-      -- stage 4 (states cleared on the x = 0 sample)
-      if s_sol3 = '1' then
-        s_s1u <= (others => '0');
-        s_s1v <= (others => '0');
-      else
-        s_s1u <= f_step(s_s1u, s_pu3, s_p8_3);
-        s_s1v <= f_step(s_s1v, s_pv3, s_p8_3);
-      end if;
-      s_sol4 <= s_sol3;
-      s_p8_4 <= s_p8_3;
-      -- stage 5
-      s_pu5  <= f_pre(shift_right(s_s1u, 8), s_p8_4);
-      s_pv5  <= f_pre(shift_right(s_s1v, 8), s_p8_4);
-      s_sol5 <= s_sol4;
-      s_p8_5 <= s_p8_4;
-      -- stage 6
-      if s_sol5 = '1' then
-        s_s2u <= (others => '0');
-        s_s2v <= (others => '0');
-      else
-        s_s2u <= f_step(s_s2u, s_pu5, s_p8_5);
-        s_s2v <= f_step(s_s2v, s_pv5, s_p8_5);
-      end if;
+      -- per-sample P / clear flags for the second pole (sample at stage 4)
+      s_sol3 <= s_sol2; s_sol4 <= s_sol3;
+      s_p8_3 <= s_p8_2; s_p8_4 <= s_p8_3;
       s_gate(3 to 9) <= s_gate(2 to 8);
     end if;
   end process;
 
-  s_uf6 <= resize(shift_right(s_s2u, 8), 14);
-  s_vf6 <= resize(shift_right(s_s2v, 8), 14);
+  -- two cascaded OP2 per channel (pre 3 / S 4, pre 5 / S 6); cleared on x = 0.
+  -- State s20: |Us|, |Vs| <= 632 so |S| <= 632*256 + 1/k < 2^18 (nothing wraps)
+  u_p1u : entity work.cbv_op2 generic map (G_WX => 12, G_WS => 20)
+    port map (clk => clk, i_x => s_us2, i_p8 => s_p8_2, i_clr => s_sol2, o_s => open, o_y => s_y1u);
+  u_p1v : entity work.cbv_op2 generic map (G_WX => 12, G_WS => 20)
+    port map (clk => clk, i_x => s_vs2, i_p8 => s_p8_2, i_clr => s_sol2, o_s => open, o_y => s_y1v);
+  u_p2u : entity work.cbv_op2 generic map (G_WX => 12, G_WS => 20)
+    port map (clk => clk, i_x => s_y1u, i_p8 => s_p8_4, i_clr => s_sol4, o_s => open, o_y => s_y2u);
+  u_p2v : entity work.cbv_op2 generic map (G_WX => 12, G_WS => 20)
+    port map (clk => clk, i_x => s_y1v, i_p8 => s_p8_4, i_clr => s_sol4, o_s => open, o_y => s_y2v);
+
+  s_uf6 <= resize(s_y2u, 14);
+  s_vf6 <= resize(s_y2v, 14);
+
+  -- H*Uf = (Uf>>1 + Uf>>3) + (Uf>>4 + Uf>>6), 2-operand adds
+  s_hu_a <= shift_right(s_uf6, 1) + shift_right(s_uf6, 3);
+  s_hu_b <= shift_right(s_uf6, 4) + shift_right(s_uf6, 6);
+  s_hv_a <= shift_right(s_vf6, 1) + shift_right(s_vf6, 3);
+  s_hv_b <= shift_right(s_vf6, 4) + shift_right(s_vf6, 6);
 
   -- ------------------------------------------------------------------ encoder domain (luma tag, stage 6)
   u_dom : entity work.cbv_domain
@@ -214,8 +185,8 @@ begin
       end if;
       s_m7   <= v_m;
       s_psi7 <= d_psi;
-      s_hu7  <= f_h(s_uf6);
-      s_hv7  <= f_h(s_vf6);
+      s_hu7  <= s_hu_a + s_hu_b;
+      s_hv7  <= s_hv_a + s_hv_b;
       s_uf7  <= s_uf6;
       s_vf7  <= s_vf6;
       s_t8_7 <= d_reg6(1);
@@ -250,22 +221,22 @@ begin
       end if;
 
       -- stage 8: carrier products (S8/C8 in {0, +-H, +-1}; negation after the shift-sum)
+      -- sign-magnitude: |S8| in {0, H, 1} with sign m in 5..7; |C8| with sign m in
+      -- 3..5 (xor sw). U keeps magnitude + sign (applied in the stage-9 add/sub),
+      -- V is negated here (one incrementer). Values identical to +-H*z, +-z.
       case to_integer(s_m7) is
-        when 0 | 4  => s_tu8 <= (others => '0');
-        when 1 | 3  => s_tu8 <= s_hu7;
-        when 2      => s_tu8 <= s_uf7;
-        when 5 | 7  => s_tu8 <= -s_hu7;
-        when others => s_tu8 <= -s_uf7;   -- 6
+        when 0 | 4      => s_tu8 <= (others => '0');
+        when 2 | 6      => s_tu8 <= s_uf7;
+        when others     => s_tu8 <= s_hu7;
       end case;
+      if s_m7 >= 5 then s_su8 <= '1'; else s_su8 <= '0'; end if;
       case to_integer(s_m7) is
-        when 2 | 6  => v_cv := (others => '0');
-        when 1 | 7  => v_cv := s_hv7;
-        when 0      => v_cv := s_vf7;
-        when 3 | 5  => v_cv := -s_hv7;
-        when others => v_cv := -s_vf7;    -- 4
+        when 2 | 6      => v_cv := (others => '0');
+        when 0 | 4      => v_cv := s_vf7;
+        when others     => v_cv := s_hv7;
       end case;
-      if s_sw7 = '1' then
-        s_tv8 <= -v_cv;
+      if (s_m7 >= 3 and s_m7 <= 5) xor (s_sw7 = '1') then
+        s_tv8 <= f_negif(v_cv, '1');
       else
         s_tv8 <= v_cv;
       end if;
@@ -291,7 +262,7 @@ begin
       if s_bf8 = '1' then
         s_c9 <= resize(s_bv8, 14);
       elsif s_gate(8) = '1' then
-        s_c9 <= s_tu8 + s_tv8;
+        s_c9 <= f_addsub(s_tv8, s_tu8, s_su8);
       else
         s_c9 <= (others => '0');
       end if;

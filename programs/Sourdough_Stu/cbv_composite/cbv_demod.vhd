@@ -24,7 +24,8 @@
 --         whose chroma is centred at n - h/2.
 --   du  = S8[md] applied to 2 cS, dv likewise (RULED Q8: H applied to 2 cS,
 --         negation after the shift-sum). cS is s13 (RULED Q14).
---   lu, lv : 2 cascaded OP2, k = kc[P], F = 8 (no clear)
+--   lu, lv : 2 cascaded OP2, k = kc[P], F = 8 (no clear); state s23: |S| <= 2^21
+--            (|du| <= 8192, DC gain 1, floor drift < 1/k LSB), so nothing wraps
 --   U4  = (sum of lu over the 4 tags of a group) >> 2 (RULED Q3): groups by
 --         r = (x_n - act0) mod 4, valid at r = 2 (P=8) / 1 (P=4); a group restarts
 --         at r = valid + 1. (A line wrap at cpl = 2 mod 4 skips the restart
@@ -73,34 +74,12 @@ architecture rtl of cbv_demod is
   signal s_md17, s_md18 : unsigned(2 downto 0) := (others => '0');
   signal s_h18, s_c2_18 : signed(14 downto 0) := (others => '0');
   signal s_du19, s_dv19 : signed(14 downto 0) := (others => '0');
-  signal s_pu20, s_pv20 : signed(23 downto 0) := (others => '0');
-  signal s_s1u, s_s1v   : signed(23 downto 0) := (others => '0');
-  signal s_pu22, s_pv22 : signed(23 downto 0) := (others => '0');
-  signal s_s2u, s_s2v   : signed(23 downto 0) := (others => '0');
+  signal s_y1u, s_y1v   : signed(14 downto 0);
+  signal s_l2u, s_l2v   : signed(14 downto 0);
   signal s_lu23, s_lv23 : signed(15 downto 0);
   signal s_au, s_av     : signed(17 downto 0) := (others => '0');
   signal s_u4, s_v4     : signed(14 downto 0) := (others => '0');
   signal s_valid        : std_logic := '0';
-
-  function f_pre(x : signed; p8 : boolean) return signed is
-    variable v : signed(23 downto 0);
-  begin
-    v := resize(x, 24);
-    if p8 then
-      return shift_left(v, 6) - v;                    -- a = 2, b = 8
-    else
-      return shift_left(v, 7) - shift_left(v, 4);     -- a = 1, b = 4
-    end if;
-  end function;
-
-  function f_step(s : signed; pre : signed; p8 : boolean) return signed is
-  begin
-    if p8 then
-      return s - shift_right(s, 2) + shift_right(s, 8) + pre;
-    else
-      return s - shift_right(s, 1) + shift_right(s, 4) + pre;
-    end if;
-  end function;
 
 begin
 
@@ -108,7 +87,8 @@ begin
     variable f    : t_fmt;
     variable v_m  : unsigned(2 downto 0);
     variable v_md : unsigned(2 downto 0);
-    variable v_cv : signed(14 downto 0);
+    variable v_cv, v_cu : signed(14 downto 0);
+    variable v_nu, v_nv : std_logic;
     variable v_sum_u, v_sum_v : signed(17 downto 0);
   begin
     if rising_edge(clk) then
@@ -143,30 +123,21 @@ begin
       s_c2_18 <= s_c2_17;
       s_md18  <= s_md17;
       -- stage 19: du = 2c S8[md], dv = 2c C8[md]
+      -- sign-magnitude select, one incrementer per channel (same values)
       case to_integer(s_md18) is
-        when 0 | 4  => s_du19 <= (others => '0');
-        when 1 | 3  => s_du19 <= s_h18;
-        when 2      => s_du19 <= s_c2_18;
-        when 5 | 7  => s_du19 <= -s_h18;
-        when others => s_du19 <= -s_c2_18;
+        when 0 | 4  => v_cu := (others => '0');
+        when 2 | 6  => v_cu := s_c2_18;
+        when others => v_cu := s_h18;
       end case;
+      if s_md18 >= 5 then v_nu := '1'; else v_nu := '0'; end if;
+      s_du19 <= f_negif(v_cu, v_nu);
       case to_integer(s_md18) is
         when 2 | 6  => v_cv := (others => '0');
-        when 1 | 7  => v_cv := s_h18;
-        when 0      => v_cv := s_c2_18;
-        when 3 | 5  => v_cv := -s_h18;
-        when others => v_cv := -s_c2_18;
+        when 0 | 4  => v_cv := s_c2_18;
+        when others => v_cv := s_h18;
       end case;
-      s_dv19 <= v_cv;
-      -- stage 20..23: two OP2 per channel (kc, F = 8)
-      s_pu20 <= f_pre(s_du19, s_p8p(19));
-      s_pv20 <= f_pre(s_dv19, s_p8p(19));
-      s_s1u  <= f_step(s_s1u, s_pu20, s_p8p(20));
-      s_s1v  <= f_step(s_s1v, s_pv20, s_p8p(20));
-      s_pu22 <= f_pre(shift_right(s_s1u, 8), s_p8p(21));
-      s_pv22 <= f_pre(shift_right(s_s1v, 8), s_p8p(21));
-      s_s2u  <= f_step(s_s2u, s_pu22, s_p8p(22));
-      s_s2v  <= f_step(s_s2v, s_pv22, s_p8p(22));
+      if s_md18 >= 3 and s_md18 <= 5 then v_nv := '1'; else v_nv := '0'; end if;
+      s_dv19 <= f_negif(v_cv, v_nv);
       -- stage 24: /4 integrate-and-dump on (x_n - act0) mod 4 (RULED Q3)
       v_sum_u := s_au + resize(s_lu23, 18);
       v_sum_v := s_av + resize(s_lv23, 18);
@@ -187,8 +158,17 @@ begin
     end if;
   end process;
 
-  s_lu23 <= resize(shift_right(s_s2u, 8), 16);
-  s_lv23 <= resize(shift_right(s_s2v, 8), 16);
+  -- stage 20..23: two OP2 per channel (kc, F = 8, never cleared), cbv_op2
+  u_p1u : entity work.cbv_op2 generic map (G_WX => 15, G_WS => 23)
+    port map (clk => clk, i_x => s_du19, i_p8 => s_p8p(19), i_clr => '0', o_s => open, o_y => s_y1u);
+  u_p1v : entity work.cbv_op2 generic map (G_WX => 15, G_WS => 23)
+    port map (clk => clk, i_x => s_dv19, i_p8 => s_p8p(19), i_clr => '0', o_s => open, o_y => s_y1v);
+  u_p2u : entity work.cbv_op2 generic map (G_WX => 15, G_WS => 23)
+    port map (clk => clk, i_x => s_y1u, i_p8 => s_p8p(21), i_clr => '0', o_s => open, o_y => s_l2u);
+  u_p2v : entity work.cbv_op2 generic map (G_WX => 15, G_WS => 23)
+    port map (clk => clk, i_x => s_y1v, i_p8 => s_p8p(21), i_clr => '0', o_s => open, o_y => s_l2v);
+  s_lu23 <= resize(s_l2u, 16);
+  s_lv23 <= resize(s_l2v, 16);
 
   o_du    <= s_du19;
   o_dv    <= s_dv19;

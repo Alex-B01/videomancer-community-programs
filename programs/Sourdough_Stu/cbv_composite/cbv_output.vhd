@@ -24,7 +24,7 @@
 --   e = sat(Yw - 716, 0, 1023). G_CODEC_ONLY: Yw = y. Written sat(Yw, 0, 1023).
 --   The luma is delayed so that it reaches the write register together
 --   with U4/V4's results (spec §5.10 "aligned at the write").
--- Write side (rolling base, spec §1.3), write domain = stage 35 newest tag x_w:
+-- Write side (rolling base, spec §1.3), write domain = stage 36 newest tag x_w:
 --   B   : B <- (B + S) mod 2048 at every write-domain line start (B_0 = 0);
 --         the x = 0 sample already uses the new B (RULED Q11)
 --   Y   : p = x_w - h/2 - act0 (notch-centred luma); we = 0 <= p < actw on
@@ -36,8 +36,9 @@
 -- G_LOOPBACK (H2): the write data are the raw input aligned to the write
 --   stage: Y of the input sample at the luma position; U/V = (Ucode >> 2,
 --   Vcode >> 2) of the input sample at 4 q + act0.
--- Pipeline: 16 y | 17 ya, yb | 18 yg | 19 e, KN | 20 dk | 21 dk*f | 22 knee |
---   23 sat -> delay -> 35 | 36 write registers (T6). RAM write on the next edge.
+-- Pipeline: 16 y | 17 ya, yb | 18 yg | 19 knee index | 20 KN, dk | 21 dk*f |
+--   22 knee | 23 sat | 24 -> delay -> 36 | 37 write registers (T6). RAM write
+--   on the next edge.
 -- Resources (paper): ~160 LC + luma delay ~120 FF; no EBR (RAMs in cbv_tame_buffer).
 --------------------------------------------------------------------------------
 library ieee;
@@ -55,10 +56,10 @@ entity cbv_output is
   port (
     clk      : in  std_logic;
     i_y      : in  signed(15 downto 0);     -- stage 16
-    i_u8     : in  unsigned(7 downto 0);    -- stage 35
+    i_u8     : in  unsigned(7 downto 0);    -- stage 36
     i_v8     : in  unsigned(7 downto 0);
-    i_uv_ok  : in  std_logic;               -- stage 35
-    -- write domain, stage 35
+    i_uv_ok  : in  std_logic;               -- stage 36
+    -- write domain, stage 36
     i_x      : in  unsigned(11 downto 0);
     i_sol    : in  std_logic;
     i_tid    : in  t_tid;
@@ -67,7 +68,7 @@ entity cbv_output is
     i_raw_y  : in  unsigned(9 downto 0);
     i_raw_u  : in  unsigned(9 downto 0);
     i_raw_v  : in  unsigned(9 downto 0);
-    -- write port registers, stage 36 (T6)
+    -- write port registers, stage 37 (T6)
     o_we_y   : out std_logic;
     o_wa_y   : out unsigned(10 downto 0);
     o_wd_y   : out unsigned(9 downto 0);
@@ -75,25 +76,25 @@ entity cbv_output is
     o_wa_uv  : out unsigned(8 downto 0);
     o_q      : out signed(11 downto 0);              -- UV word index q (T6)
     o_wd_uv  : out std_logic_vector(15 downto 0);   -- U8 & V8
-    o_b      : out unsigned(10 downto 0)            -- write base B used by the stage-36 sample
+    o_b      : out unsigned(10 downto 0)            -- write base B used by the stage-37 sample
   );
 end entity cbv_output;
 
 architecture rtl of cbv_output is
-  constant C_YDLY : natural := C_ST_UV8 - 23;   -- 12
+  constant C_YDLY : natural := C_ST_UV8 - 24;   -- 12
   type t_ydly is array (1 to C_YDLY) of unsigned(9 downto 0);
   signal s_ydly : t_ydly := (others => (others => '0'));
 
   signal s_y17, s_ya17, s_yb17 : signed(15 downto 0) := (others => '0');
   signal s_yg18, s_yg19, s_yg20, s_yg21 : signed(15 downto 0) := (others => '0');
   signal s_big19, s_big20, s_big21 : std_logic := '0';
-  signal s_dk19 : unsigned(4 downto 0) := (others => '0');
-  signal s_kb19, s_kb20, s_kb21 : signed(10 downto 0) := (others => '0');  -- 716 + KN[k]
+  signal s_ki19 : unsigned(5 downto 0) := (others => '0');
+  signal s_kb20, s_kb21 : signed(10 downto 0) := (others => '0');  -- 716 + KN[k]
   signal s_ef19, s_ef20 : unsigned(3 downto 0) := (others => '0');
   signal s_dk20 : unsigned(4 downto 0) := (others => '0');
   signal s_pr21 : unsigned(4 downto 0) := (others => '0');
   signal s_yw22 : signed(15 downto 0) := (others => '0');
-  signal s_yw23 : unsigned(9 downto 0) := (others => '0');
+  signal s_yw23, s_yw24 : unsigned(9 downto 0) := (others => '0');
 
   signal s_b    : unsigned(10 downto 0) := (others => '0');
   signal s_b36  : unsigned(10 downto 0) := (others => '0');
@@ -128,18 +129,16 @@ begin
       else
         s_yg18 <= s_ya17 + s_yb17;
       end if;
-      -- 19
+      -- 19: knee index registered first (timing: saturate | ROM + add in separate clocks)
       v_e := f_satr(resize(s_yg18, 17) - C_KNEE_T, 0, 1023, 16);
-      v_k := to_integer(unsigned(v_e(9 downto 4)));
-      -- KN read straight into arithmetic (keeps the 65-entry table in LUTs, A6)
-      s_dk19   <= resize(to_unsigned(C_KN(v_k + 1), 9) - to_unsigned(C_KN(v_k), 9), 5);
-      s_kb19   <= to_signed(C_KNEE_T, 11) + signed(resize(to_unsigned(C_KN(v_k), 9), 11));
-      s_ef19   <= unsigned(v_e(3 downto 0));
+      s_ki19 <= unsigned(v_e(9 downto 4));
+      s_ef19 <= unsigned(v_e(3 downto 0));
       if s_yg18 > C_KNEE_T and not G_CODEC_ONLY then s_big19 <= '1'; else s_big19 <= '0'; end if;
       s_yg19 <= s_yg18;
-      -- 20
-      s_dk20   <= s_dk19;
-      s_kb20   <= s_kb19;
+      -- 20: KN reads straight into arithmetic (keeps the 65-entry table in LUTs, A6)
+      v_k := to_integer(s_ki19);
+      s_dk20   <= resize(to_unsigned(C_KN(v_k + 1), 9) - to_unsigned(C_KN(v_k), 9), 5);
+      s_kb20   <= to_signed(C_KNEE_T, 11) + signed(resize(to_unsigned(C_KN(v_k), 9), 11));
       s_ef20   <= s_ef19;
       s_big20  <= s_big19;
       s_yg20   <= s_yg19;
@@ -155,15 +154,16 @@ begin
         v_yw := s_yg21;
       end if;
       s_yw22 <= v_yw;
-      -- 23
+      -- 23, 24
       s_yw23 <= unsigned(f_satr(resize(s_yw22, 17), 0, 1023, 11)(9 downto 0));
-      -- delay 24 .. 35
-      s_ydly(1) <= s_yw23;
+      s_yw24 <= s_yw23;
+      -- delay 25 .. 36
+      s_ydly(1) <= s_yw24;
       s_ydly(2 to C_YDLY) <= s_ydly(1 to C_YDLY - 1);
     end if;
   end process;
 
-  -- ------------------------------------------------------------------ write side (stage 35 -> 36)
+  -- ------------------------------------------------------------------ write side (stage 36 -> 37)
   p_write : process(clk)
     variable f     : t_fmt;
     variable v_py  : signed(13 downto 0);
@@ -187,9 +187,9 @@ begin
       v_yd := s_ydly(C_YDLY);
       v_uvd := std_logic_vector(i_u8) & std_logic_vector(i_v8);
       if G_LOOPBACK then
-        v_r := s_raw(34 + f.ye + f.h2);
+        v_r := s_raw(C_ST_UV8 - 1 + f.ye + f.h2);
         v_yd := unsigned(v_r(29 downto 20));
-        v_r := s_raw(34 + f.ye + f.kq);
+        v_r := s_raw(C_ST_UV8 - 1 + f.ye + f.kq);
         v_uvd := v_r(19 downto 12) & v_r(9 downto 2);
       end if;
       -- Y

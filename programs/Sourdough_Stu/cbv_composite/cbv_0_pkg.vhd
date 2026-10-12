@@ -207,13 +207,17 @@ package cbv_pkg is
   constant C_ST_YC    : natural := 16;  -- chosen y, c
   constant C_ST_DU    : natural := 19;  -- du, dv; burst gate accumulation input
   constant C_ST_U4    : natural := 24;  -- U4, V4 (/4 valid)
-  constant C_ST_M1    : natural := 30;  -- uu, vq
-  constant C_ST_UV8   : natural := 35;  -- U8/V8, Yw, write domain registers
-  constant C_ST_WR    : natural := 36;  -- write-port registers (RAM write on the next edge)
+  constant C_ST_M1    : natural := 31;  -- vq (uu at 29)
+  constant C_ST_UV8   : natural := 36;  -- U8/V8, Yw, write domain registers
+  constant C_ST_WR    : natural := 37;  -- write-port registers (RAM write on the next edge)
 
   function f_h(z : signed) return signed;
   function f_sat(z : signed; w : natural) return signed;
   function f_satr(z : signed; lo, hi : integer; w : natural) return signed;
+  -- a + b (sub = '0') or a - b (sub = '1') as ONE carry chain: a + (b xor sub) + sub
+  function f_addsub(a, b : signed; sub : std_logic) return signed;
+  -- b or -b (neg = '1'), one incrementer: (b xor neg) + neg
+  function f_negif(b : signed; neg : std_logic) return signed;
 
 end package cbv_pkg;
 
@@ -312,6 +316,22 @@ package body cbv_pkg is
     if z > hi then return to_signed(hi, w);
     elsif z < lo then return to_signed(lo, w);
     else return resize(z, w); end if;
+  end function;
+
+  function f_addsub(a, b : signed; sub : std_logic) return signed is
+    variable v_b  : signed(a'length - 1 downto 0);
+    variable v_ci : signed(a'length - 1 downto 0) := (others => '0');
+  begin
+    v_b := resize(b, a'length) xor (a'length - 1 downto 0 => sub);
+    v_ci(0) := sub;
+    return a + v_b + v_ci;
+  end function;
+
+  function f_negif(b : signed; neg : std_logic) return signed is
+    variable v_ci : signed(b'length - 1 downto 0) := (others => '0');
+  begin
+    v_ci(0) := neg;
+    return (b xor (b'length - 1 downto 0 => neg)) + v_ci;
   end function;
 
 end package body cbv_pkg;

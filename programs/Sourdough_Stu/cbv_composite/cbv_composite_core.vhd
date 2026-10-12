@@ -48,10 +48,10 @@
 --   13-16 Y/C split (notch, comb RAM)                 cbv_ycsplit       T3 @16
 --   16-24 demod, LPF, /4                              cbv_demod         T4 @24
 --   13-~95 burst gate, serial colour engine           cbv_colour_engine T5 per line
---   24-30 M1 rotation                                 cbv_m1_rotate
---   30-35 M2 gain, PAL-S, killer, U8/V8               cbv_m2_gain
---   16-35 luma gain/knee + delay; 35 write domain     cbv_output
---   36    write-port registers (L_w = 36)             cbv_output        T6 @36
+--   24-31 M1 rotation (uu 29, vq 31)                 cbv_m1_rotate
+--   29-36 M2 gain, PAL-S, killer, U8/V8               cbv_m2_gain
+--   16-36 luma gain/knee + delay; 36 write domain     cbv_output
+--   37    write-port registers (L_w = 37)             cbv_output        T6 @37
 -- Boundary (data_in -> data_out), spec §1.1:
 --   1 input register | 2 read address | 3 EBR read | 4 EBR output register |
 --   5 UV interp 1 | 6 UV interp 2 | 7 R1 clamp | 8 AVID gate + output reg
@@ -66,11 +66,13 @@
 --   sine quarter-wave 256x12 ....... 1   (cbv_m1_rotate)
 --   program total ................. 15   (16 on dual configs incl. the core's)
 -- Multipliers (inferred `*`, none in a 1-clock recursion; no multiplier_s):
---   M1 14x12 (4 slots), M2 14x13 (2 slots); plus small constant/LUT-size
+--   M1 14x12 as two registered 14x6 halves (4 slots), M2 one 14x7 digit-serial
+--   (4 half-slots); plus small constant/LUT-size
 --   products (knee dk*f 5x4, read-side d*f 10x3).
 --
--- LC estimate (spec-stage1.md §4): (a) 2,440 + (b) 804 + glue 488 = 3,730
---   paper, ~3,250 packed; full design on sd_dual ~5,000 (4,400-5,700).
+-- LC: spec-stage1.md §4 paper ~4,100 / ~3,600 packed. Measured (yosys
+--   synth_ice40 -noflatten, program only, sd_dual): 5af85f4 8,880 LUT4 /
+--   3,678 FF; rev 3 8,063 / 3,557; area pass 6,011 / 3,409 (bit-identical taps).
 --
 -- Register map (Stage 1 reads only):
 --   registers_in(6)(1) T8 Encode (0 NTSC, 1 PAL)
@@ -184,11 +186,11 @@ architecture rtl of cbv_composite_core is
 
   -- M1 / M2
   signal s_uu, s_vq : signed(13 downto 0);
-  signal s_m1_ok : std_logic;
+  signal s_m1_ok, s_m1_uok : std_logic;
   signal s_u8, s_v8 : unsigned(7 downto 0);
   signal s_uv_ok : std_logic;
 
-  -- write domain (stage 35)
+  -- write domain (stage 36)
   signal dw_hs, dw_vs, dw_avid, dw_sol, dw_lp, dw_vline : std_logic;
   signal dw_x   : unsigned(11 downto 0);
   signal dw_psi : unsigned(2 downto 0);
@@ -246,7 +248,7 @@ architecture rtl of cbv_composite_core is
   signal t5_kcnt    : unsigned(10 downto 0);
   signal t5_sw_tv   : std_logic;
   signal t5_idc     : unsigned(2 downto 0);
-  -- T6 (stage 36 write-port registers)
+  -- T6 (stage 37 write-port registers)
   signal t6_we_y   : std_logic;
   signal t6_wa_y   : unsigned(10 downto 0);
   signal t6_yw     : unsigned(9 downto 0);
@@ -259,7 +261,7 @@ architecture rtl of cbv_composite_core is
   -- domain x tags for the testbench
   signal t_x_dec   : unsigned(11 downto 0);   -- stage 10
   signal t_x_yc    : unsigned(11 downto 0);   -- stage 13
-  signal t_x_wr    : unsigned(11 downto 0);   -- stage 35
+  signal t_x_wr    : unsigned(11 downto 0);   -- stage 36
 
 begin
 
@@ -390,13 +392,13 @@ begin
   u_m1 : entity work.cbv_m1_rotate
     port map (
       clk => clk, i_u4 => s_u4, i_v4 => s_v4, i_valid => s_u4_ok, i_sol => s_solp(C_ST_U4),
-      i_apc_ph => s_apc_ph, o_uu => s_uu, o_vq => s_vq, o_valid => s_m1_ok,
+      i_apc_ph => s_apc_ph, o_uu => s_uu, o_vq => s_vq, o_valid => s_m1_ok, o_uvalid => s_m1_uok,
       o_cos => s_cos, o_sin => s_sin);
 
   u_m2 : entity work.cbv_m2_gain
     generic map (G_CODEC_ONLY => G_CODEC_ONLY)
     port map (
-      clk => clk, i_uu => s_uu, i_vq => s_vq, i_valid => s_m1_ok, i_sol => s_solp(C_ST_M1),
+      clk => clk, i_uu => s_uu, i_vq => s_vq, i_uvalid => s_m1_uok, i_valid => s_m1_ok, i_sol => s_solp(C_ST_M1 - 1),
       i_gu => s_gu_line, i_gv => s_gv_line, i_col_on => s_col_on, i_t9 => s_reg6(2),
       i_sw_pic => s_sw_pic, o_u8 => s_u8, o_v8 => s_v8, o_valid => s_uv_ok);
 
